@@ -1,5 +1,0 @@
-websockets
-python-dotenv
-requests
-deltalake
-boto3

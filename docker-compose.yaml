@@ -4,8 +4,6 @@ services:
       context: ./app_receiver
       dockerfile: Dockerfile
     image: streaming-arm/python:3.13-slim
-    # env_file:
-    #   - .env
     environment:
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}

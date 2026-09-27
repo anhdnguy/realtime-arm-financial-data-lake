@@ -3,7 +3,6 @@ import asyncio
 import json
 import boto3
 import boto3.session
-import json
 from dotenv import load_dotenv
 
 from websockets.asyncio.client import connect

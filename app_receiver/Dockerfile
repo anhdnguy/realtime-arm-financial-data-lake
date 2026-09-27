@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY . ./app/
+COPY . .
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && \
@@ -24,4 +24,4 @@ USER appuser
 ENV PYTHONUNBUFFERED=1
 
 # Run the application
-CMD ["python", "-m", "app.test"]
+CMD ["python", "-m", "main"]

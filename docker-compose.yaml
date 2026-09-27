@@ -1,11 +1,11 @@
 services:
-  data_stream:
+  receiver:
     build:
-      context: ./app
+      context: ./app_receiver
       dockerfile: Dockerfile
     image: streaming-arm/python:3.13-slim
-    env_file:
-      - .env
+    # env_file:
+    #   - .env
     environment:
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
@@ -14,8 +14,8 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_REGION: ${AWS_REGION}
-      DELTA_TABLE_URI: ${DELTA_TABLE_URI}
       KINESIS_STREAM_ARN: ${KINESIS_STREAM_ARN}
+      STREAM_NAME: ${STREAM_NAME}
     networks:
       - shared-network
 

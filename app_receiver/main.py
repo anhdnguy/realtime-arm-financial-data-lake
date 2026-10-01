@@ -2,6 +2,7 @@ import asyncio
 from asyncio.exceptions import CancelledError
 import boto3
 import boto3.session
+from botocore.exceptions import ClientError
 import json
 import signal
 
@@ -12,6 +13,8 @@ from config import AppConfig
 from logger import setup_logger
 
 logger = setup_logger(__name__)
+
+LIST_TICKERS = ["FAKEPACA"]
 
 def signal_handler(signum, task_producer):
     """
@@ -30,8 +33,9 @@ async def producer(queue):
             logger.info(f"producer: Recieved {message}")
             json_message = json.loads(message)
             if json_message[0]["T"] == 't':
-                logger.info(f"producer: Sending message to Queue: {json_message[0]}")
-                await queue.put(json_message[0])            
+                logger.info(f"producer: Sending message to Queue: {json_message}")
+                for m in json_message:
+                    await queue.put(m)
 
     uri = f"{AppConfig.alpaca_uri}/test"
     headers = {
@@ -40,9 +44,7 @@ async def producer(queue):
     }
     msg = {
         "action": "subscribe",
-        "trades": [
-            "FAKEPACA"
-        ]
+        "trades": LIST_TICKERS
     }
     str_dict = json.dumps(msg)
     bytestring = bytes(str_dict, 'utf-8')
@@ -83,21 +85,41 @@ def put_record_kinesis(data):
     return response
 
 async def consumer(queue):
+    latest_mark = dict.fromkeys(LIST_TICKERS, "")
     while True:
         data = await queue.get()
         logger.info(f"consumer: Received message from Queue: {data}")
         if data is None:
+            await write_dynamodb(latest_mark)
             break
-        await asyncio.to_thread(put_record_kinesis, data)
-        await asyncio.sleep(10)
+        try:
+            await asyncio.to_thread(put_record_kinesis, data)
+            latest_mark[data["S"]] = data["t"]
+        except:
+            logger.error(f"consumer: Failed to put_record to kinesis: {data}")
+
+async def write_dynamodb(latest_mark = None):
+    dynamodb = boto3.client('dynamodb', region_name=AppConfig.aws_region)
+    try:
+        dynamodb.update_item(
+            TableName=AppConfig.table_name,
+            Key={
+                "id": AppConfig.mark_id
+            },
+            UpdateExpression="SET dict = :m",
+            ExpressionAttributeValues={":m": latest_mark}
+        )
+    except ClientError:
+        raise ClientError(f"Dynamodb Update Failed")
 
 async def main():
     """
     Main application entry point.
     """
-    queue = asyncio.Queue()
+    queue = asyncio.Queue(maxsize=200)
     task_producer = asyncio.create_task(producer(queue))
     task_consumer = asyncio.create_task(consumer(queue))
+    task_write_dynamodb = asyncio.create_task()
 
     loop = asyncio.get_running_loop()
     
@@ -110,7 +132,8 @@ async def main():
         )
     await asyncio.gather(
         task_producer,
-        task_consumer
+        task_consumer,
+        task_write_dynamodb
     )
 
 asyncio.run(main())

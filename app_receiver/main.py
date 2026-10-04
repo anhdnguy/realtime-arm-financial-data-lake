@@ -2,7 +2,7 @@ import asyncio
 from asyncio.exceptions import CancelledError
 import boto3
 import boto3.session
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, BotoCoreError
 import json
 import signal
 
@@ -16,7 +16,7 @@ logger = setup_logger(__name__)
 
 LIST_TICKERS = ["FAKEPACA"]
 
-def signal_handler(signum, task_producer):
+def signal_handler(signum, task_producer, event):
     """
     Handle shutdown signals (SIGTERM, SIGINT).
     
@@ -24,6 +24,7 @@ def signal_handler(signum, task_producer):
     CTRL+C sends SIGINT during local testing.
     """
     logger.info(f"shutdown_handler: Received signal {signum}, initiating graceful shutdown...")
+    event.set()
     task_producer.cancel()
 
 async def producer(queue):
@@ -84,13 +85,12 @@ def put_record_kinesis(data):
     logger.info(f"put_record_kinesis: Done putting records to Kinesis: {response}")
     return response
 
-async def consumer(queue):
-    latest_mark = dict.fromkeys(LIST_TICKERS, "")
+async def consumer(queue, latest_mark):
     while True:
         data = await queue.get()
         logger.info(f"consumer: Received message from Queue: {data}")
         if data is None:
-            await write_dynamodb(latest_mark)
+            await asyncio.to_thread(write_dynamodb, latest_mark.copy())
             break
         try:
             await asyncio.to_thread(put_record_kinesis, data)
@@ -98,28 +98,56 @@ async def consumer(queue):
         except:
             logger.error(f"consumer: Failed to put_record to kinesis: {data}")
 
-async def write_dynamodb(latest_mark = None):
-    dynamodb = boto3.client('dynamodb', region_name=AppConfig.aws_region)
+def write_dynamodb(latest_mark):
+    logger.info(f"write_dynamodb: Writing latest_mark to Dynamodb...")
+    dynamodb = boto3.resource(
+        'dynamodb',
+        endpoint_url = AppConfig.aws_endpoint_url,
+        region_name=AppConfig.aws_region)
+    table = dynamodb.Table(AppConfig.table_name)
     try:
-        dynamodb.update_item(
-            TableName=AppConfig.table_name,
-            Key={
-                "id": AppConfig.mark_id
-            },
-            UpdateExpression="SET dict = :m",
-            ExpressionAttributeValues={":m": latest_mark}
-        )
+        for ticker, trade_ts in latest_mark.items():
+            if trade_ts:
+                table.put_item(
+                    Item = {
+                        "ticker": ticker,
+                        "trade_ts": trade_ts
+                    }
+                )
     except ClientError:
-        raise ClientError(f"Dynamodb Update Failed")
+        logger.error("write_dynamodb: Client Error")
+        raise
+    except BotoCoreError:
+        logger.error("write_dynamodb: Network Error")
+        raise
+
+async def timer(latest_mark, event):
+    while True:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=5)
+            break
+        except asyncio.TimeoutError:
+            try:
+                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
+            except ClientError:
+                logger.error("timer: Update to DynamodDB - Client Error")
+                continue
+            except BotoCoreError:
+                logger.error("timer: Update to DynamodDB - Network Error")
+                continue
 
 async def main():
     """
     Main application entry point.
     """
+    event = asyncio.Event()
+
+    latest_mark = dict.fromkeys(LIST_TICKERS, "")
+
     queue = asyncio.Queue(maxsize=200)
     task_producer = asyncio.create_task(producer(queue))
-    task_consumer = asyncio.create_task(consumer(queue))
-    task_write_dynamodb = asyncio.create_task()
+    task_consumer = asyncio.create_task(consumer(queue, latest_mark))
+    task_timer = asyncio.create_task(timer(latest_mark, event))
 
     loop = asyncio.get_running_loop()
     
@@ -128,12 +156,13 @@ async def main():
             getattr(signal, signame),
             signal_handler,
             signame,
-            task_producer
+            task_producer,
+            event
         )
     await asyncio.gather(
         task_producer,
         task_consumer,
-        task_write_dynamodb
+        task_timer
     )
 
 asyncio.run(main())

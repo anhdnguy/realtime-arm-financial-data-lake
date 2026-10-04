@@ -16,4 +16,3 @@ class AppConfig:
     kinesis_stream_arn: str = os.getenv("KINESIS_STREAM_ARN")
     stream_name: str = os.getenv("STREAM_NAME")
     table_name: str = os.getenv("DYNAMODB_TABLE_NAME")
-    mark_id: str = os.getenv("DYNAMODB_ITEM_ID")

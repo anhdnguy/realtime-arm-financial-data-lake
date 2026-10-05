@@ -14,6 +14,7 @@ services:
       AWS_REGION: ${AWS_REGION}
       KINESIS_STREAM_ARN: ${KINESIS_STREAM_ARN}
       STREAM_NAME: ${STREAM_NAME}
+      DYNAMODB_TABLE_NAME: ${DYNAMODB_TABLE_NAME}
     networks:
       - shared-network
 

@@ -5,7 +5,6 @@ import boto3.session
 from botocore.exceptions import ClientError, BotoCoreError
 import json
 import signal
-import time
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed

@@ -5,6 +5,7 @@ import boto3.session
 from botocore.exceptions import ClientError, BotoCoreError
 import json
 import signal
+import time
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -14,9 +15,18 @@ from logger import setup_logger
 
 logger = setup_logger(__name__)
 
-LIST_TICKERS = ["FAKEPACA"]
+LIST_TICKERS = [
+    "FAKEPACA"
+]
+MAX_WAIT = 30
+MAX_ATTEMPT = 10
+TEMP_ERROR = set([
+    "ProvisionedThroughputExceededException",
+    "KMSThrottlingException",
+    "InternalFailureException"
+])
 
-def signal_handler(signum, task_producer, event):
+def signal_handler(signum, task_producer, shutdown_event):
     """
     Handle shutdown signals (SIGTERM, SIGINT).
     
@@ -24,10 +34,45 @@ def signal_handler(signum, task_producer, event):
     CTRL+C sends SIGINT during local testing.
     """
     logger.info(f"shutdown_handler: Received signal {signum}, initiating graceful shutdown...")
-    event.set()
+    shutdown_event.set()
     task_producer.cancel()
 
-async def producer(queue):
+def is_temporary(exc):
+    if isinstance(exc, BotoCoreError):
+        return True
+
+    if isinstance(exc, ClientError):
+        if exc.response['Error']['Code'] in TEMP_ERROR:
+            return True
+        return False
+
+    return False
+
+async def retry(data, shutdown_event):
+    attempt = 1
+    last_error = None
+    while attempt <= MAX_ATTEMPT:
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=min(2 ** attempt, MAX_WAIT))
+            return False
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            logger.info(f"retry: Retry attempt {attempt}...")
+            await asyncio.to_thread(put_record_kinesis, data)
+            return True
+        except Exception as e:
+            logger.info(f"retry: Retry attempt {attempt} failed: {e}")
+            if is_temporary(e):
+                attempt += 1
+                last_error = e
+            else:
+                raise
+
+    raise RuntimeError(f"retry: gave up after {MAX_ATTEMPT} tries") from last_error
+
+async def producer(queue, shutdown_event):
     async def fetch_data(queue, websocket):
         while True:
             message = await websocket.recv()
@@ -59,8 +104,12 @@ async def producer(queue):
             except ConnectionClosed:
                 continue
     except CancelledError:
-        logger.info("producer: Producer received a shutdown signal, attempt to graceful shutdown...")
-        await queue.put(None)
+        if shutdown_event.is_set():
+            logger.info("producer: Producer received a shutdown signal, attempt to graceful shutdown...")
+            await queue.put(None)
+        else:
+            logger.info("producer: Someone else cancelled, re raise...")
+            raise
 
 def put_record_kinesis(data):
     logger.info(f"put_record_kinesis: Putting record to Kinesis...")
@@ -85,18 +134,43 @@ def put_record_kinesis(data):
     logger.info(f"put_record_kinesis: Done putting records to Kinesis: {response}")
     return response
 
-async def consumer(queue, latest_mark):
+async def consumer(queue, shutdown_event, latest_mark):
+    counter = 0
+    discarding = False
     while True:
         data = await queue.get()
         logger.info(f"consumer: Received message from Queue: {data}")
+
         if data is None:
-            await asyncio.to_thread(write_dynamodb, latest_mark.copy())
+            try:
+                logger.info("consumer: Attempt to save before shutdown...")
+                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
+            except (ClientError, BotoCoreError) as e:
+                logger.error(f"consumer: Last save failed: {e}")
+            logger.info(f"consumer: Discard count: {counter}")
             break
+
+        if discarding:
+            counter += 1
+            continue
+
         try:
+            logger.info(f"consumer: Try to put record to Kinesis: {data}")
             await asyncio.to_thread(put_record_kinesis, data)
             latest_mark[data["S"]] = data["t"]
-        except:
-            logger.error(f"consumer: Failed to put_record to kinesis: {data}")
+        except Exception as e:
+            logger.warning(f"consumer: Failed to put record to Kinesis: {e}")
+            if is_temporary(e):
+                status = await retry(data, shutdown_event)
+                if status:
+                    latest_mark[data["S"]] = data["t"]
+                else:
+                    discarding = True
+            elif isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
+                # Logging to DLQ function goes here
+                logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
+            else:
+                raise
 
 def write_dynamodb(latest_mark):
     logger.info(f"write_dynamodb: Writing latest_mark to Dynamodb...")
@@ -121,10 +195,10 @@ def write_dynamodb(latest_mark):
         logger.error("write_dynamodb: Network Error")
         raise
 
-async def timer(latest_mark, event):
+async def timer(latest_mark, shutdown_event):
     while True:
         try:
-            await asyncio.wait_for(event.wait(), timeout=5)
+            await asyncio.wait_for(shutdown_event.wait(), timeout=5)
             break
         except asyncio.TimeoutError:
             try:
@@ -140,14 +214,14 @@ async def main():
     """
     Main application entry point.
     """
-    event = asyncio.Event()
+    shutdown_event = asyncio.Event()
 
     latest_mark = dict.fromkeys(LIST_TICKERS, "")
 
     queue = asyncio.Queue(maxsize=200)
-    task_producer = asyncio.create_task(producer(queue))
-    task_consumer = asyncio.create_task(consumer(queue, latest_mark))
-    task_timer = asyncio.create_task(timer(latest_mark, event))
+    task_producer = asyncio.create_task(producer(queue, shutdown_event))
+    task_consumer = asyncio.create_task(consumer(queue, shutdown_event, latest_mark))
+    task_timer = asyncio.create_task(timer(latest_mark, shutdown_event))
 
     loop = asyncio.get_running_loop()
     
@@ -157,7 +231,7 @@ async def main():
             signal_handler,
             signame,
             task_producer,
-            event
+            shutdown_event
         )
     await asyncio.gather(
         task_producer,

@@ -4,6 +4,8 @@ import boto3
 import boto3.session
 from botocore.exceptions import ClientError, BotoCoreError
 import json
+from io import BytesIO
+import pandas as pd
 import signal
 
 from websockets.asyncio.client import connect
@@ -132,6 +134,34 @@ def put_record_kinesis(data):
 
     logger.info(f"put_record_kinesis: Done putting records to Kinesis: {response}")
     return response
+
+def save_record_s3(data):
+    logger.infor(f"save_record_s3: Saving record to DLQ...")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url = AppConfig.aws_endpoint_url,
+        region_name = AppConfig.aws_region
+    )
+    bucket = AppConfig.s3_bucket
+    key = f"{data['S']}_{data['t']}_{data['i']}"
+    buffer = BytesIO()
+    df = pd.DataFrame(list(data.items()), column=["Key", "Value"])
+    df.to_parquet(buffer, index=False)
+    buffer.seek(0)
+
+    try:
+        s3.upload_fileobj(buffer, bucket, key)
+        logger.info(f"save_record_s3: Uploaded data to DLQ: s3://{bucket}/{key}")
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+
+        if error_code == 'NoSuchBucket':
+            logger.error(f"save_record_s3: Bucket not found: {bucket}")
+        else:
+            logger.error(f"save_record_s3: S3 upload failed ClientErrro: {str(e)}")
+    except Exception as e:
+        logger.error(f"save_record_s3: Upload failed: {str(e)}")
+
 
 async def consumer(queue, shutdown_event, latest_mark):
     counter = 0

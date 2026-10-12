@@ -15,6 +15,7 @@ services:
       KINESIS_STREAM_ARN: ${KINESIS_STREAM_ARN}
       STREAM_NAME: ${STREAM_NAME}
       DYNAMODB_TABLE_NAME: ${DYNAMODB_TABLE_NAME}
+      S3_BUCKET: ${S3_BUCKET}
     networks:
       - shared-network
 

@@ -16,3 +16,4 @@ class AppConfig:
     kinesis_stream_arn: str = os.getenv("KINESIS_STREAM_ARN")
     stream_name: str = os.getenv("STREAM_NAME")
     table_name: str = os.getenv("DYNAMODB_TABLE_NAME")
+    s3_bucket: str = os.getenv("S3_BUCKET")

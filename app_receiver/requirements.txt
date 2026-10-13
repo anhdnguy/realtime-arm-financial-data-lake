@@ -3,3 +3,4 @@ python-dotenv
 requests
 deltalake
 boto3
+pandas

@@ -15,12 +15,11 @@ class KinesisClient:
 
     def put_record(self, data):
         logger.info(f"put_record_kinesis: Putting record to Kinesis...")
-        response = self.kinesis.put_record(
+        self.kinesis.put_record(
             StreamName = AppConfig.stream_name,
             Data = json.dumps(data).encode('utf-8'),
             PartitionKey = data['S'],
             StreamARN = AppConfig.kinesis_stream_arn
         )
 
-        logger.info(f"put_record_kinesis: Done putting records to Kinesis: {response}")
-        return response
+        logger.info(f"put_record_kinesis: Done putting records to Kinesis: {json.dumps(data)}")

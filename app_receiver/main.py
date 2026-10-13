@@ -12,7 +12,10 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
 from config import AppConfig
+from dynamodb_client import DynamoDBClient
+from kinesis_client import KinesisClient
 from logger import setup_logger
+from s3_client import S3Client
 
 logger = setup_logger(__name__)
 
@@ -49,7 +52,7 @@ def is_temporary(exc):
 
     return False
 
-async def retry(data, shutdown_event):
+async def retry(data, shutdown_event, put_record_kinesis):
     attempt = 1
     last_error = None
     while attempt <= MAX_ATTEMPT:
@@ -112,29 +115,6 @@ async def producer(queue, shutdown_event):
             logger.info("producer: Someone else cancelled, re raise...")
             raise
 
-def put_record_kinesis(data):
-    logger.info(f"put_record_kinesis: Putting record to Kinesis...")
-    session = boto3.session.Session(
-        region_name = AppConfig.aws_region,
-        aws_access_key_id = AppConfig.aws_access_key_id,
-        aws_secret_access_key = AppConfig.aws_secret_access_key
-    )
-    kinesis = session.client(
-        "kinesis",
-        endpoint_url = AppConfig.aws_endpoint_url,
-        region_name = AppConfig.aws_region
-    )
-
-    response = kinesis.put_record(
-        StreamName = AppConfig.stream_name,
-        Data = json.dumps(data).encode('utf-8'),
-        PartitionKey = data['S'],
-        StreamARN = AppConfig.kinesis_stream_arn
-    )
-
-    logger.info(f"put_record_kinesis: Done putting records to Kinesis: {response}")
-    return response
-
 def save_record_s3(data):
     logger.infor(f"save_record_s3: Saving record to DLQ...")
     s3 = boto3.client(
@@ -143,7 +123,7 @@ def save_record_s3(data):
         region_name = AppConfig.aws_region
     )
     bucket = AppConfig.s3_bucket
-    key = f"{data['S']}_{data['t']}_{data['i']}"
+    key = f"{data['S']}_{data['t']}_{data['i']}.parquet"
     buffer = BytesIO()
     df = pd.DataFrame(list(data.items()), column=["Key", "Value"])
     df.to_parquet(buffer, index=False)
@@ -157,13 +137,25 @@ def save_record_s3(data):
 
         if error_code == 'NoSuchBucket':
             logger.error(f"save_record_s3: Bucket not found: {bucket}")
+            raise
         else:
-            logger.error(f"save_record_s3: S3 upload failed ClientErrro: {str(e)}")
+            logger.error(f"save_record_s3: S3 upload failed ClientError: {str(e)}")
+            raise
     except Exception as e:
-        logger.error(f"save_record_s3: Upload failed: {str(e)}")
+        logger.error(
+            f"save_record_s3: S3 upload failed: {str(e)}",
+            f"save_record_s3: DLQ_WRITE_FAILED: {json.dumps(data)}"
+        )
 
 
-async def consumer(queue, shutdown_event, latest_mark):
+async def consumer(
+        queue,
+        shutdown_event,
+        latest_mark,
+        write_dynamodb,
+        put_record_kinesis,
+        save_record_s3
+    ):
     counter = 0
     discarding = False
     while True:
@@ -190,41 +182,18 @@ async def consumer(queue, shutdown_event, latest_mark):
         except Exception as e:
             logger.warning(f"consumer: Failed to put record to Kinesis: {e}")
             if is_temporary(e):
-                status = await retry(data, shutdown_event)
+                status = await retry(data, shutdown_event, put_record_kinesis)
                 if status:
                     latest_mark[data["S"]] = data["t"]
                 else:
                     discarding = True
             elif isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                # Logging to DLQ function goes here
+                save_record_s3(data)
                 logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
             else:
                 raise
 
-def write_dynamodb(latest_mark):
-    logger.info(f"write_dynamodb: Writing latest_mark to Dynamodb...")
-    dynamodb = boto3.resource(
-        'dynamodb',
-        endpoint_url = AppConfig.aws_endpoint_url,
-        region_name=AppConfig.aws_region)
-    table = dynamodb.Table(AppConfig.table_name)
-    try:
-        for ticker, trade_ts in latest_mark.items():
-            if trade_ts:
-                table.put_item(
-                    Item = {
-                        "ticker": ticker,
-                        "trade_ts": trade_ts
-                    }
-                )
-    except ClientError:
-        logger.error("write_dynamodb: Client Error")
-        raise
-    except BotoCoreError:
-        logger.error("write_dynamodb: Network Error")
-        raise
-
-async def timer(latest_mark, shutdown_event):
+async def timer(latest_mark, shutdown_event, write_dynamodb):
     while True:
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=5)
@@ -243,14 +212,33 @@ async def main():
     """
     Main application entry point.
     """
+    session = boto3.session.Session(
+        region_name = AppConfig.aws_region,
+        aws_access_key_id = AppConfig.aws_access_key_id,
+        aws_secret_access_key = AppConfig.aws_secret_access_key
+    )
+    dynamodb = DynamoDBClient(session)
+    kinesis = KinesisClient(session)
+    s3 = S3Client(session)
     shutdown_event = asyncio.Event()
 
     latest_mark = dict.fromkeys(LIST_TICKERS, "")
 
     queue = asyncio.Queue(maxsize=200)
     task_producer = asyncio.create_task(producer(queue, shutdown_event))
-    task_consumer = asyncio.create_task(consumer(queue, shutdown_event, latest_mark))
-    task_timer = asyncio.create_task(timer(latest_mark, shutdown_event))
+    task_consumer = asyncio.create_task(consumer(
+        queue,
+        shutdown_event,
+        latest_mark,
+        dynamodb.put_item,
+        kinesis.put_record,
+        s3.upload_obj
+    ))
+    task_timer = asyncio.create_task(timer(
+        latest_mark,
+        shutdown_event,
+        dynamodb.put_item
+    ))
 
     loop = asyncio.get_running_loop()
     

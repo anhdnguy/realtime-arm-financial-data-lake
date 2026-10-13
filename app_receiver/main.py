@@ -4,8 +4,6 @@ import boto3
 import boto3.session
 from botocore.exceptions import ClientError, BotoCoreError
 import json
-from io import BytesIO
-import pandas as pd
 import signal
 
 from websockets.asyncio.client import connect
@@ -114,39 +112,6 @@ async def producer(queue, shutdown_event):
         else:
             logger.info("producer: Someone else cancelled, re raise...")
             raise
-
-def save_record_s3(data):
-    logger.infor(f"save_record_s3: Saving record to DLQ...")
-    s3 = boto3.client(
-        "s3",
-        endpoint_url = AppConfig.aws_endpoint_url,
-        region_name = AppConfig.aws_region
-    )
-    bucket = AppConfig.s3_bucket
-    key = f"{data['S']}_{data['t']}_{data['i']}.parquet"
-    buffer = BytesIO()
-    df = pd.DataFrame(list(data.items()), column=["Key", "Value"])
-    df.to_parquet(buffer, index=False)
-    buffer.seek(0)
-
-    try:
-        s3.upload_fileobj(buffer, bucket, key)
-        logger.info(f"save_record_s3: Uploaded data to DLQ: s3://{bucket}/{key}")
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-
-        if error_code == 'NoSuchBucket':
-            logger.error(f"save_record_s3: Bucket not found: {bucket}")
-            raise
-        else:
-            logger.error(f"save_record_s3: S3 upload failed ClientError: {str(e)}")
-            raise
-    except Exception as e:
-        logger.error(
-            f"save_record_s3: S3 upload failed: {str(e)}",
-            f"save_record_s3: DLQ_WRITE_FAILED: {json.dumps(data)}"
-        )
-
 
 async def consumer(
         queue,

@@ -121,6 +121,7 @@ async def consumer(
         put_record_kinesis,
         save_record_s3
     ):
+    dlq_counter = 0
     counter = 0
     discarding = False
     while True:
@@ -153,8 +154,11 @@ async def consumer(
                 else:
                     discarding = True
             elif isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                save_record_s3(data)
-                logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
+                try:
+                    logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
+                    save_record_s3(data)
+                except (ClientError, Exception) as e:
+                    dlq_counter += 1
             else:
                 raise
 

@@ -3,6 +3,7 @@ from asyncio.exceptions import CancelledError
 import boto3
 import boto3.session
 from botocore.exceptions import ClientError, BotoCoreError
+from functools import partial
 import json
 import signal
 
@@ -25,7 +26,11 @@ MAX_ATTEMPT = 10
 TEMP_ERROR = set([
     "ProvisionedThroughputExceededException",
     "KMSThrottlingException",
-    "InternalFailureException"
+    "InternalFailureException",
+    "SlowDown",
+    "InternalError",
+    "RequestTimeout",
+    "ServiceUnavailable"
 ])
 
 def signal_handler(signum, task_producer, shutdown_event):
@@ -50,7 +55,7 @@ def is_temporary(exc):
 
     return False
 
-async def retry(data, shutdown_event, put_record_kinesis):
+async def retry(data, shutdown_event, method):
     attempt = 1
     last_error = None
     while attempt <= MAX_ATTEMPT:
@@ -62,7 +67,7 @@ async def retry(data, shutdown_event, put_record_kinesis):
 
         try:
             logger.info(f"retry: Retry attempt {attempt}...")
-            await asyncio.to_thread(put_record_kinesis, data)
+            await asyncio.to_thread(method, data)
             return True
         except Exception as e:
             logger.info(f"retry: Retry attempt {attempt} failed: {e}")
@@ -113,6 +118,21 @@ async def producer(queue, shutdown_event):
             logger.info("producer: Someone else cancelled, re raise...")
             raise
 
+async def send_to_dlq(raw, error, shutdown_event, save_record_s3):
+    try:
+        key = await asyncio.to_thread(save_record_s3, raw, error)
+        logger.warning(f"send_to_dlq: saved to DLQ: {key}")
+    except Exception as e:
+        logger.warning(f"send_to_dlq: Failed to put message to DLQ: {e}")
+        if is_temporary(e):
+            save_record_s3_with_raw = partial(save_record_s3, raw)
+            status = await retry(error, shutdown_event, save_record_s3_with_raw)
+            if not status:
+                logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {e} - {raw}")
+        else:
+            logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {e} - {raw}")
+    
+
 async def consumer(
         queue,
         shutdown_event,
@@ -158,7 +178,10 @@ async def consumer(
                     logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
                     save_record_s3(data)
                 except (ClientError, Exception) as e:
-                    dlq_counter += 1
+                    logger.error(
+                        f"save_record_s3: S3 upload failed: {str(e)}",
+                        f"save_record_s3: DLQ_WRITE_FAILED: {json.dumps(data)}"
+                    )
             else:
                 raise
 
@@ -225,4 +248,5 @@ async def main():
         task_timer
     )
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())

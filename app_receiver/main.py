@@ -55,7 +55,7 @@ def is_temporary(exc):
 
     return False
 
-async def retry(data, shutdown_event, method):
+async def retry(arg, shutdown_event, method):
     attempt = 1
     last_error = None
     while attempt <= MAX_ATTEMPT:
@@ -67,7 +67,7 @@ async def retry(data, shutdown_event, method):
 
         try:
             logger.info(f"retry: Retry attempt {attempt}...")
-            await asyncio.to_thread(method, data)
+            await asyncio.to_thread(method, arg)
             return True
         except Exception as e:
             logger.info(f"retry: Retry attempt {attempt} failed: {e}")
@@ -118,20 +118,31 @@ async def producer(queue, shutdown_event):
             logger.info("producer: Someone else cancelled, re raise...")
             raise
 
-async def send_to_dlq(raw, error, shutdown_event, save_record_s3):
+async def save_with_retry(raw, error, shutdown_event, save_record_s3):
+    
     try:
-        key = await asyncio.to_thread(save_record_s3, raw, error)
-        logger.warning(f"send_to_dlq: saved to DLQ: {key}")
+        await asyncio.to_thread(save_record_s3, raw, error)
+        return True
     except Exception as e:
-        logger.warning(f"send_to_dlq: Failed to put message to DLQ: {e}")
         if is_temporary(e):
+            logger.warning(f"save_with_retry: DLQ write failed with temp error, enter retry: {e}")
             save_record_s3_with_raw = partial(save_record_s3, raw)
             status = await retry(error, shutdown_event, save_record_s3_with_raw)
-            if not status:
-                logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {e} - {raw}")
+            return status
         else:
-            logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {e} - {raw}")
-    
+            logger.warning(f"save_with_retry: Save to DLQ failed with permanent error: {type(e).__name__}")
+            raise
+
+
+async def send_to_dlq(raw, error, shutdown_event, save_record_s3):
+    try:
+        status = await save_with_retry(raw, error, shutdown_event, save_record_s3)
+        if not status:
+            logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {error} - interrupted by shutdown - {raw}")
+        return status
+    except Exception as e:
+        logger.error(f"send_to_dlq: DLQ_WRITE_FAILED: {error} - {e} - {raw}")
+        return False
 
 async def consumer(
         queue,
@@ -141,7 +152,6 @@ async def consumer(
         put_record_kinesis,
         save_record_s3
     ):
-    dlq_counter = 0
     counter = 0
     discarding = False
     while True:
@@ -174,14 +184,7 @@ async def consumer(
                 else:
                     discarding = True
             elif isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                try:
-                    logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
-                    save_record_s3(data)
-                except (ClientError, Exception) as e:
-                    logger.error(
-                        f"save_record_s3: S3 upload failed: {str(e)}",
-                        f"save_record_s3: DLQ_WRITE_FAILED: {json.dumps(data)}"
-                    )
+                await send_to_dlq(data, e, shutdown_event, save_record_s3)
             else:
                 raise
 
@@ -224,7 +227,7 @@ async def main():
         latest_mark,
         dynamodb.put_item,
         kinesis.put_record,
-        s3.upload_obj
+        s3.put_dlq_record
     ))
     task_timer = asyncio.create_task(timer(
         latest_mark,

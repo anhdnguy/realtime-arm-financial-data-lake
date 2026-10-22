@@ -1,7 +1,7 @@
 from botocore.exceptions import ClientError
 from functools import partial
 
-from dlq import send_to_dlq
+from dlq import hand_off
 from logger import setup_logger
 from retry import retry
 
@@ -9,10 +9,10 @@ logger = setup_logger(__name__)
 
 async def consumer(
         queue,
+        dlq_queue,
         shutdown_event,
         latest_mark,
-        put_record_kinesis,
-        save_record_s3
+        put_record_kinesis
     ):
     """
     Send each queued trade to Kinesis and advance its ticker's mark.
@@ -47,6 +47,6 @@ async def consumer(
         except Exception as e:
             if isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
                 logger.warning(f"consumer: Kinesis rejected the record, sending it to the DLQ: {e}")
-                await send_to_dlq(data, e, shutdown_event, save_record_s3)
+                hand_off(dlq_queue, data, e)
             else:
                 raise

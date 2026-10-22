@@ -7,6 +7,7 @@ from botocore.exceptions import ClientError
 
 import timer as timer_module
 from consumer import consumer
+from dlq import dlq_worker
 from main import ShutdownSignals, run
 from timer import timer
 
@@ -34,9 +35,11 @@ class Recorder:
 class Pipeline:
     """Builds run() with the real consumer and timer and fake AWS calls."""
 
-    def __init__(self, kinesis_delay=0.0, kinesis_errors=None, timer_write_delay=0.0):
+    def __init__(self, kinesis_delay=0.0, kinesis_errors=None, timer_write_delay=0.0, s3_delay=0.0):
         self.shutdown = asyncio.Event()
         self.queue = asyncio.Queue(maxsize=200)
+        self.dlq_queue = asyncio.Queue(maxsize=100)
+        self.s3_delay = s3_delay
         self.marks = {"FAKEPACA": ""}
         self.log = Recorder()
         self.kinesis_delay = kinesis_delay
@@ -59,16 +62,23 @@ class Pipeline:
     def final_write(self, marks):
         self.log.add("final_save", marks["FAKEPACA"])
 
-    async def run(self, producer, drain_timeout=5):
+    def s3_write(self, raw, error):
+        time.sleep(self.s3_delay)
+        self.log.add("dlq", raw["t"])
+
+    async def run(self, producer, drain_timeout=5, dlq_drain_timeout=5):
         return await run(
             self.shutdown,
             self.queue,
+            self.dlq_queue,
             self.marks,
             producer=producer,
-            consumer=consumer(self.queue, self.shutdown, self.marks, self.put_record, lambda raw, err: None),
+            consumer=consumer(self.queue, self.dlq_queue, self.shutdown, self.marks, self.put_record),
             timer=timer(self.marks, self.shutdown, self.timer_write),
+            dlq_worker=dlq_worker(self.dlq_queue, self.shutdown, self.s3_write),
             write_marks=self.final_write,
             drain_timeout=drain_timeout,
+            dlq_drain_timeout=dlq_drain_timeout,
         )
 
 
@@ -165,6 +175,39 @@ async def test_failed_final_save_exits_1():
     code = await asyncio.wait_for(p.run(feed(p.queue, [])), timeout=5)
 
     assert code == 1
+
+
+# --- DLQ at shutdown ---
+
+async def test_record_rejected_during_drain_still_reaches_the_dlq():
+    # The last trade is rejected while the queue drains, after shutdown started.
+    # The DLQ None must come after that handoff, or the record is silently lost.
+    p = Pipeline(kinesis_delay=0.02, kinesis_errors={5: client_error("InvalidArgumentException")})
+    trades = [trade(n) for n in range(5)]
+    stop_after(p.shutdown, 0.01)
+
+    code = await asyncio.wait_for(p.run(feed(p.queue, trades)), timeout=5)
+
+    assert code == 0
+    assert ("dlq", trades[-1]["t"]) in p.log.events
+    # The rejected trade never reached Kinesis, so the mark stays on the one before it.
+    assert ("final_save", trades[-2]["t"]) in p.log.events
+
+
+async def test_dlq_drain_deadline_logs_a_marker_for_every_unwritten_record(caplog):
+    p = Pipeline(kinesis_errors={n: client_error("InvalidArgumentException") for n in range(1, 4)}, s3_delay=0.3)
+    stop_after(p.shutdown, 0.05)
+
+    code = await asyncio.wait_for(p.run(feed(p.queue, [trade(n) for n in range(3)]), dlq_drain_timeout=0.1), timeout=5)
+
+    assert code == 0
+    written = {e[1] for e in p.log.events if e[0] == "dlq"}
+    markers = [r.getMessage() for r in caplog.records if "DLQ_WRITE_FAILED" in r.getMessage()]
+    # Every rejected record is in S3 or has its marker line, never neither.
+    for t in [trade(n)["t"] for n in range(3)]:
+        assert t in written or any(t in m for m in markers), f"{t} silently lost"
+    assert any("cancelled at shutdown" in m for m in markers)
+    assert any("not written before shutdown" in m for m in markers)
 
 
 # --- signals ---

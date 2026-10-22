@@ -6,6 +6,7 @@ import sys
 
 from config import AppConfig, TICKERS
 from consumer import consumer
+from dlq import DLQ_QUEUE_SIZE, dlq_worker, log_unsent
 from dynamodb_client import DynamoDBClient
 from kinesis_client import KinesisClient
 from logger import setup_logger
@@ -18,8 +19,13 @@ logger = setup_logger(__name__)
 QUEUE_SIZE = 200
 # Time the consumer gets to empty the queue at shutdown. Records still queued after
 # this are not lost: the marks don't cover them, so backfill fetches them again.
-# Must fit, with the final save, inside stop_grace_period (docker-compose.yaml).
 DRAIN_TIMEOUT = 15
+# Time the DLQ worker gets to write what's left. Records still queued after this
+# are logged as DLQ_WRITE_FAILED (their only copy).
+DLQ_DRAIN_TIMEOUT = 5
+# Worst case: 15s drain + timer write and final save (each bounded by BOTO_CONFIG,
+# ~10s) + 5s DLQ drain. stop_grace_period in docker-compose.yaml (and ECS
+# stopTimeout) must stay above this, or SIGKILL lands before the DLQ markers.
 
 
 class ShutdownSignals:
@@ -50,8 +56,9 @@ class ShutdownSignals:
             loop.add_signal_handler(getattr(signal, signame), self.handle, signame)
 
 
-async def run(shutdown_event, queue, latest_mark, producer, consumer, timer, write_marks,
-              drain_timeout=DRAIN_TIMEOUT):
+async def run(shutdown_event, queue, dlq_queue, latest_mark,
+              producer, consumer, timer, dlq_worker, write_marks,
+              drain_timeout=DRAIN_TIMEOUT, dlq_drain_timeout=DLQ_DRAIN_TIMEOUT):
     """
     Run the pipeline until a shutdown signal or until any task ends (a crash),
     then stop everything in order. Returns the exit code: 0 clean, 1 crash.
@@ -63,11 +70,15 @@ async def run(shutdown_event, queue, latest_mark, producer, consumer, timer, wri
       4. wait for the timer       - an in-flight timer write must finish before the
                                     final save, or an older mark could land last
       5. final mark save          - also runs after a crash, marks are still good
+      6. put None on dlq_queue    - only now: producer and consumer are both done,
+                                    so no handoff can come after it
+      7. wait for the DLQ worker  - at most dlq_drain_timeout; leftovers get markers
     """
     task_producer = asyncio.create_task(producer, name="producer")
     task_consumer = asyncio.create_task(consumer, name="consumer")
     task_timer = asyncio.create_task(timer, name="timer")
-    tasks = [task_producer, task_consumer, task_timer]
+    task_dlq = asyncio.create_task(dlq_worker, name="dlq_worker")
+    tasks = [task_producer, task_consumer, task_timer, task_dlq]
 
     task_signal = asyncio.create_task(shutdown_event.wait(), name="shutdown_signal")
     await asyncio.wait([*tasks, task_signal], return_when=asyncio.FIRST_COMPLETED)
@@ -110,6 +121,22 @@ async def run(shutdown_event, queue, latest_mark, producer, consumer, timer, wri
         logger.error(f"main: final mark save failed ({type(e).__name__}: {e}), restart will resend from older marks")
         exit_code = 1
 
+    # 6 + 7. Let the DLQ worker write what's left, within its deadline.
+    try:
+        async with asyncio.timeout(dlq_drain_timeout):
+            if not task_dlq.done():
+                await dlq_queue.put(None)
+            await asyncio.wait([task_dlq])
+        logger.info("main: DLQ worker finished")
+    except TimeoutError:
+        logger.error(f"main: DLQ worker did not finish within {dlq_drain_timeout}s")
+        task_dlq.cancel()
+        await asyncio.wait([task_dlq])
+    # Normally empty. Non-empty after a DLQ timeout or a worker crash.
+    lost = log_unsent(dlq_queue)
+    if lost:
+        logger.error(f"main: {lost} DLQ records were not written, see DLQ_WRITE_FAILED lines")
+
     for task in tasks:
         if not task.cancelled() and task.exception() is not None:
             logger.error(f"main: {task.get_name()} crashed", exc_info=task.exception())
@@ -136,6 +163,7 @@ async def main():
 
     shutdown_event = asyncio.Event()
     queue = asyncio.Queue(maxsize=QUEUE_SIZE)
+    dlq_queue = asyncio.Queue(maxsize=DLQ_QUEUE_SIZE)
     latest_mark = dict.fromkeys(TICKERS, "")
 
     signals = ShutdownSignals(shutdown_event, asyncio.current_task())
@@ -145,10 +173,12 @@ async def main():
         return await run(
             shutdown_event,
             queue,
+            dlq_queue,
             latest_mark,
             producer=producer(queue),
-            consumer=consumer(queue, shutdown_event, latest_mark, kinesis.put_record, s3.put_dlq_record),
+            consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kinesis.put_record),
             timer=timer(latest_mark, shutdown_event, dynamodb.put_item),
+            dlq_worker=dlq_worker(dlq_queue, shutdown_event, s3.put_dlq_record),
             write_marks=dynamodb.put_item,
         )
     except asyncio.CancelledError:

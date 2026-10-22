@@ -99,10 +99,10 @@ async def producer(queue, shutdown_event):
     async def fetch_data(queue, websocket):
         while True:
             message = await websocket.recv()
-            logger.info(f"producer: Recieved {message}")
+            logger.debug(f"producer: Received {message}")
             json_message = json.loads(message)
             if json_message[0]["T"] == 't':
-                logger.info(f"producer: Sending message to Queue: {json_message}")
+                logger.debug(f"producer: Sending message to Queue: {json_message}")
                 for m in json_message:
                     await queue.put(m)
 
@@ -167,7 +167,7 @@ async def consumer(
     discarding = False
     while True:
         data = await queue.get()
-        logger.info(f"consumer: Received message from Queue: {data}")
+        logger.debug(f"consumer: Received message from Queue: {data}")
 
         if data is None:
             try:
@@ -183,7 +183,7 @@ async def consumer(
             continue
 
         try:
-            logger.info(f"consumer: Try to put record to Kinesis: {data}")
+            logger.debug(f"consumer: Try to put record to Kinesis: {data}")
             status = await retry(partial(put_record_kinesis, data), shutdown_event)
             if status:
                 latest_mark[data["S"]] = data["t"]
@@ -192,7 +192,7 @@ async def consumer(
 
         except Exception as e:
             if isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                logger.info(f"consumer: Sending data to DLQ because: {e}")
+                logger.warning(f"consumer: Kinesis rejected the record, sending it to the DLQ: {e}")
                 await send_to_dlq(data, e, shutdown_event, save_record_s3)
             else:
                 raise

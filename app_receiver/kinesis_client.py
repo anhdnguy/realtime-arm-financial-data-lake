@@ -15,7 +15,7 @@ class KinesisClient:
         )
 
     def put_record(self, data):
-        logger.info(f"put_record_kinesis: Putting record to Kinesis...")
+        logger.debug("put_record_kinesis: Putting record to Kinesis...")
         self.kinesis.put_record(
             StreamName = AppConfig.stream_name,
             Data = json.dumps(data).encode('utf-8'),
@@ -23,4 +23,4 @@ class KinesisClient:
             StreamARN = AppConfig.kinesis_stream_arn
         )
 
-        logger.info(f"put_record_kinesis: Done putting records to Kinesis: {json.dumps(data)}")
+        logger.debug(f"put_record_kinesis: Done putting records to Kinesis: {json.dumps(data)}")

@@ -175,7 +175,7 @@ async def main():
             queue,
             dlq_queue,
             latest_mark,
-            producer=producer(queue),
+            producer=producer(queue, dlq_queue),
             consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kinesis.put_record),
             timer=timer(latest_mark, shutdown_event, dynamodb.put_item),
             dlq_worker=dlq_worker(dlq_queue, shutdown_event, s3.put_dlq_record),

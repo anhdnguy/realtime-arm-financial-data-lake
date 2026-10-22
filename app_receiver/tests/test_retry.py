@@ -3,8 +3,9 @@ import asyncio
 import pytest
 from botocore.exceptions import ClientError
 
-import main
-from main import MAX_ATTEMPT, RetryExhausted, retry, send_to_dlq
+import retry as retry_module
+from dlq import send_to_dlq
+from retry import MAX_ATTEMPT, RetryExhausted, retry
 
 
 def client_error(code):
@@ -46,7 +47,7 @@ def waits(monkeypatch):
             return True
         raise asyncio.TimeoutError
 
-    monkeypatch.setattr(main.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(retry_module.asyncio, "wait_for", fake_wait_for)
     shutdown = asyncio.Event()
     return timeouts, shutdown
 

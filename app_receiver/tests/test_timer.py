@@ -3,8 +3,8 @@ import asyncio
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 
-import main
-from main import timer
+import timer as timer_module
+from timer import timer
 
 
 def client_error(code):
@@ -26,7 +26,7 @@ class Writer:
 
 @pytest.fixture(autouse=True)
 def fast_ticks(monkeypatch):
-    monkeypatch.setattr(main, "SAVE_INTERVAL", 0.01)
+    monkeypatch.setattr(timer_module, "SAVE_INTERVAL", 0.01)
 
 
 def stop_after(shutdown, seconds):

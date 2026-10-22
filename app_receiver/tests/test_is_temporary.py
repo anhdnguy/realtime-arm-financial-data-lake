@@ -10,7 +10,7 @@ from botocore.exceptions import (
     ReadTimeoutError,
 )
 
-from main import is_temporary
+from retry import is_temporary
 
 
 def client_error(code):

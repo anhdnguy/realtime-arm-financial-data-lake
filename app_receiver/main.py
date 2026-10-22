@@ -21,6 +21,7 @@ logger = setup_logger(__name__)
 
 MAX_WAIT = 30
 MAX_ATTEMPT = 10
+SAVE_INTERVAL = 5
 TEMP_ERROR = set([
     "ProvisionedThroughputExceededException",
     "KMSThrottlingException",
@@ -197,19 +198,28 @@ async def consumer(
                 raise
 
 async def timer(latest_mark, shutdown_event, write_dynamodb):
+    """
+    Save the marks every SAVE_INTERVAL seconds until shutdown.
+
+    - Temporary error: log and keep going. The next tick (or the final save)
+      catches up; a stale mark only means more duplicates, never a gap.
+    - Permanent error (AccessDenied, ResourceNotFound, ...): raise and crash.
+      A container that streams without saving marks breaks the backfill promise.
+    """
     while True:
         try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=5)
-            break
+            await asyncio.wait_for(shutdown_event.wait(), timeout=SAVE_INTERVAL)
+            return
         except asyncio.TimeoutError:
-            try:
-                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
-            except ClientError:
-                logger.error("timer: Update to DynamodDB - Client Error")
-                continue
-            except BotoCoreError:
-                logger.error("timer: Update to DynamodDB - Network Error")
-                continue
+            pass
+
+        try:
+            await asyncio.to_thread(write_dynamodb, latest_mark.copy())
+        except Exception as e:
+            if not is_temporary(e):
+                logger.error(f"timer: permanent error saving marks, crashing: {type(e).__name__}: {e}")
+                raise
+            logger.error(f"timer: temporary error saving marks, trying again next tick: {type(e).__name__}: {e}")
 
 async def main():
     """

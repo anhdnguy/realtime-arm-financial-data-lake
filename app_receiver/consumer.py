@@ -1,5 +1,4 @@
-import asyncio
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import ClientError
 from functools import partial
 
 from dlq import send_to_dlq
@@ -12,10 +11,17 @@ async def consumer(
         queue,
         shutdown_event,
         latest_mark,
-        write_dynamodb,
         put_record_kinesis,
         save_record_s3
     ):
+    """
+    Send each queued trade to Kinesis and advance its ticker's mark.
+    Returns on None, which main puts after the last record at shutdown.
+
+    If a retry gives up because of shutdown, every later record is discarded
+    without a try. The mark must not move past a record that never reached
+    Kinesis, or backfill would skip it.
+    """
     counter = 0
     discarding = False
     while True:
@@ -23,13 +29,8 @@ async def consumer(
         logger.debug(f"consumer: Received message from Queue: {data}")
 
         if data is None:
-            try:
-                logger.info("consumer: Attempt to save before shutdown...")
-                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
-            except (ClientError, BotoCoreError) as e:
-                logger.error(f"consumer: Last save failed: {e}")
-            logger.info(f"consumer: Discard count: {counter}")
-            break
+            logger.info(f"consumer: queue drained, discarded {counter} records after a retry gave up")
+            return
 
         if discarding:
             counter += 1

@@ -1,4 +1,3 @@
-from asyncio.exceptions import CancelledError
 import json
 
 from websockets.asyncio.client import connect
@@ -9,7 +8,11 @@ from logger import setup_logger
 
 logger = setup_logger(__name__)
 
-async def producer(queue, shutdown_event):
+async def producer(queue):
+    """
+    Stream trades from Alpaca into the queue until cancelled.
+    main cancels it at shutdown and then puts the None that stops the consumer.
+    """
     async def fetch_data(queue, websocket):
         while True:
             message = await websocket.recv()
@@ -32,18 +35,10 @@ async def producer(queue, shutdown_event):
     str_dict = json.dumps(msg)
     bytestring = bytes(str_dict, 'utf-8')
 
-    try:
-        async for websocket in connect(uri=uri, additional_headers=headers):
-            try:
-                await websocket.send(bytestring)
-                await fetch_data(queue, websocket)
+    async for websocket in connect(uri=uri, additional_headers=headers):
+        try:
+            await websocket.send(bytestring)
+            await fetch_data(queue, websocket)
 
-            except ConnectionClosed:
-                continue
-    except CancelledError:
-        if shutdown_event.is_set():
-            logger.info("producer: Producer received a shutdown signal, attempt to graceful shutdown...")
-            await queue.put(None)
-        else:
-            logger.info("producer: Someone else cancelled, re raise...")
-            raise
+        except ConnectionClosed:
+            continue

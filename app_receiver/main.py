@@ -2,7 +2,8 @@ import asyncio
 from asyncio.exceptions import CancelledError
 import boto3
 import boto3.session
-from botocore.exceptions import ClientError, BotoCoreError
+from botocore.exceptions import ClientError, BotoCoreError, HTTPClientError
+from botocore.exceptions import ConnectionError as BotoConnectionError
 from functools import partial
 import json
 import signal
@@ -45,13 +46,17 @@ def signal_handler(signum, task_producer, shutdown_event):
     task_producer.cancel()
 
 def is_temporary(exc):
-    if isinstance(exc, BotoCoreError):
+    """
+    True when a retry can help: network trouble, or AWS asking us to slow down.
+
+    Every other BotoCoreError (ParamValidationError, NoCredentialsError,
+    NoRegionError, ...) is a setup or code fault. Retrying it only delays the crash.
+    """
+    if isinstance(exc, (BotoConnectionError, HTTPClientError)):
         return True
 
     if isinstance(exc, ClientError):
-        if exc.response['Error']['Code'] in TEMP_ERROR:
-            return True
-        return False
+        return exc.response.get('Error', {}).get('Code') in TEMP_ERROR
 
     return False
 

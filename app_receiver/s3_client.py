@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import json
 import uuid
 
-from config import AppConfig
+from config import AppConfig, BOTO_CONFIG
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -12,7 +12,8 @@ class S3Client:
         self.s3 = session.client(
             "s3",
             endpoint_url = AppConfig.aws_endpoint_url,
-            region_name = AppConfig.aws_region
+            region_name = AppConfig.aws_region,
+            config = BOTO_CONFIG
         )
         self.bucket = AppConfig.s3_bucket
 

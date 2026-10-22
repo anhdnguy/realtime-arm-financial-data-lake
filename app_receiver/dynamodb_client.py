@@ -1,6 +1,6 @@
 from botocore.exceptions import ClientError, BotoCoreError
 
-from config import AppConfig
+from config import AppConfig, BOTO_CONFIG
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -10,7 +10,8 @@ class DynamoDBClient:
         self.dynamodb = session.client(
             "dynamodb",
             endpoint_url = AppConfig.aws_endpoint_url,
-            region_name = AppConfig.aws_region
+            region_name = AppConfig.aws_region,
+            config = BOTO_CONFIG
         )
 
     def put_item(self, latest_mark):

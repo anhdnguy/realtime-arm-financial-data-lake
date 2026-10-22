@@ -11,7 +11,7 @@ import signal
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-from config import AppConfig
+from config import AppConfig, TICKERS
 from dynamodb_client import DynamoDBClient
 from kinesis_client import KinesisClient
 from logger import setup_logger
@@ -19,9 +19,6 @@ from s3_client import S3Client
 
 logger = setup_logger(__name__)
 
-LIST_TICKERS = [
-    "FAKEPACA"
-]
 MAX_WAIT = 30
 MAX_ATTEMPT = 10
 TEMP_ERROR = set([
@@ -115,7 +112,7 @@ async def producer(queue, shutdown_event):
     }
     msg = {
         "action": "subscribe",
-        "trades": LIST_TICKERS
+        "trades": TICKERS
     }
     str_dict = json.dumps(msg)
     bytestring = bytes(str_dict, 'utf-8')
@@ -218,6 +215,8 @@ async def main():
     """
     Main application entry point.
     """
+    AppConfig.validate()
+
     session = boto3.session.Session(
         region_name = AppConfig.aws_region,
         aws_access_key_id = AppConfig.aws_access_key_id,
@@ -228,7 +227,7 @@ async def main():
     s3 = S3Client(session)
     shutdown_event = asyncio.Event()
 
-    latest_mark = dict.fromkeys(LIST_TICKERS, "")
+    latest_mark = dict.fromkeys(TICKERS, "")
 
     queue = asyncio.Queue(maxsize=200)
     task_producer = asyncio.create_task(producer(queue, shutdown_event))

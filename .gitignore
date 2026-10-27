@@ -3,8 +3,3 @@ notes.txt
 BUILD_LOG.md
 __pycache__/
 .pytest_cache/
-
-pytest.ini
-requirements-dev.txt
-run_tests.sh
-/tests

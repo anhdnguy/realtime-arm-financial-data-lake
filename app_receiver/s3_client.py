@@ -1,9 +1,8 @@
-from botocore.exceptions import ClientError, BotoCoreError
-from io import BytesIO
+from datetime import datetime, timezone
 import json
-import pandas as pd
+import uuid
 
-from config import AppConfig
+from config import AppConfig, BOTO_CONFIG
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -13,33 +12,30 @@ class S3Client:
         self.s3 = session.client(
             "s3",
             endpoint_url = AppConfig.aws_endpoint_url,
-            region_name = AppConfig.aws_region
+            region_name = AppConfig.aws_region,
+            config = BOTO_CONFIG
         )
         self.bucket = AppConfig.s3_bucket
 
-    def upload_obj(self, data):
-        logger.info(f"save_record_s3: Saving record to DLQ...")
-        key = f"{data['S']}_{data['t']}_{data['i']}.parquet"
+    def put_dlq_record(self, raw, error):
+        if not isinstance(raw, str):
+            raw = json.dumps(raw)
 
-        buffer = BytesIO()
-        df = pd.DataFrame(list(data.items()), column=["Key", "Value"])
-        df.to_parquet(buffer, index=False)
-        buffer.seek(0)
+        now = datetime.now(timezone.utc)
+        failure_time = now.strftime("%Y%m%dT%H%M%S.%fZ")
+        key = f"dlq/{now.strftime("%Y/%m/%d")}/{failure_time}_{uuid.uuid4()}.txt"
+        body = "\n".join([
+            f"failed_at: {failure_time}",
+            f"error_type: {type(error).__name__}",
+            f"error_message: {error}",
+            f"raw: {raw}",
+        ])
+        self.s3.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=body.encode('utf-8'),
+            ContentType="text/plain; charset=utf-8"
+        )
 
-        try:
-            self.s3.upload_fileobj(buffer, self.bucket, key)
-            logger.info(f"save_record_s3: Uploaded data to DLQ: s3://{self.bucket}/{key}")
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-        
-            if error_code == 'NoSuchBucket':
-                logger.error(f"save_record_s3: Bucket not found: {self.bucket}")
-                raise
-            else:
-                logger.error(f"save_record_s3: S3 upload failed ClientError: {str(e)}")
-                raise
-        except Exception as e:
-            logger.error(
-                f"save_record_s3: S3 upload failed: {str(e)}",
-                f"save_record_s3: DLQ_WRITE_FAILED: {json.dumps(data)}"
-            )
+        logger.info(f"put_dlq_record: Record is saved to DLQ: {key}")
+        return key

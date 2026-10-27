@@ -1,2 +1,5 @@
 .env
 notes.txt
+BUILD_LOG.md
+__pycache__/
+.pytest_cache/

@@ -1,6 +1,2 @@
-websockets
-python-dotenv
-requests
-deltalake
-boto3
-pandas
+websockets==17.3
+boto3==1.43.117

@@ -1,9 +1,77 @@
+# One tag for the broker and the topic-init job, so their tools always match.
+x-kafka-image: &kafka-image apache/kafka:4.3.2
+
 services:
+  broker:
+    image: *kafka-image
+    container_name: broker
+    ports:
+      - "9092:9092"  # EXTERNAL listener, for tools on the host
+    environment:
+      # Single node that is both broker and controller (KRaft, no ZooKeeper).
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Stored with the data in the volume. Changing it makes the broker refuse the old data.
+      CLUSTER_ID: h5Cq7D0xSHitc4PoSYLy-Q
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Two client listeners, because a client reconnects to whatever address the broker
+      # advertises. Containers on shared-network get broker:29092; the host gets localhost:9092.
+      # Bind on 0.0.0.0: a port mapping can't reach the container's loopback.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://broker:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Topics come only from kafka-init. Otherwise the first write to a misspelled
+      # topic quietly creates it with default settings instead of failing.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # One node, so internal topics can only have one copy.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data  # survives `down`; `down -v` wipes it
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      start_period: 30s
+      retries: 6
+    networks:
+      - shared-network
+
+  # One-off job: creates the topic, then exits 0. Safe to rerun (--if-not-exists).
+  # Partition count is fixed here; adding partitions later moves tickers to new partitions.
+  kafka-init:
+    image: *kafka-image
+    depends_on:
+      broker:
+        condition: service_healthy
+    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    command:
+      - --bootstrap-server=broker:29092
+      - --create
+      - --if-not-exists
+      - --topic=${KAFKA_TOPIC:-trades}
+      - --partitions=3
+      - --replication-factor=1
+    restart: "no"
+    networks:
+      - shared-network
+
   receiver:
     build:
       context: ./app_receiver
       dockerfile: Dockerfile
     image: streaming-arm/python:3.13-slim
+    stop_grace_period: 45s  # must exceed the worst-case shutdown in app_receiver/main.py
+    depends_on:
+      broker:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       ALPACA_API_KEY: ${ALPACA_API_KEY}
       ALPACA_API_SECRET: ${ALPACA_API_SECRET}
@@ -16,9 +84,13 @@ services:
       STREAM_NAME: ${STREAM_NAME}
       DYNAMODB_TABLE_NAME: ${DYNAMODB_TABLE_NAME}
       S3_BUCKET: ${S3_BUCKET}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     networks:
       - shared-network
 
 networks:
   shared-network:
     external: true
+
+volumes:
+  kafka-data:

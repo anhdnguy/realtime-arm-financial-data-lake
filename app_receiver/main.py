@@ -1,186 +1,157 @@
 import asyncio
-from asyncio.exceptions import CancelledError
 import boto3
 import boto3.session
-from botocore.exceptions import ClientError, BotoCoreError
-import json
 import signal
+import sys
 
-from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed
-
-from config import AppConfig
+from config import AppConfig, TICKERS
+from consumer import consumer
+from dlq import DLQ_QUEUE_SIZE, dlq_worker, log_unsent
 from dynamodb_client import DynamoDBClient
 from kinesis_client import KinesisClient
 from logger import setup_logger
+from producer import producer
 from s3_client import S3Client
+from timer import timer
 
 logger = setup_logger(__name__)
 
-LIST_TICKERS = [
-    "FAKEPACA"
-]
-MAX_WAIT = 30
-MAX_ATTEMPT = 10
-TEMP_ERROR = set([
-    "ProvisionedThroughputExceededException",
-    "KMSThrottlingException",
-    "InternalFailureException"
-])
+QUEUE_SIZE = 200
+# Time the consumer gets to empty the queue at shutdown. Records still queued after
+# this are not lost: the marks don't cover them, so backfill fetches them again.
+DRAIN_TIMEOUT = 15
+# Time the DLQ worker gets to write what's left. Records still queued after this
+# are logged as DLQ_WRITE_FAILED (their only copy).
+DLQ_DRAIN_TIMEOUT = 5
+# Worst case: 15s drain + timer write and final save (each bounded by BOTO_CONFIG,
+# ~10s) + 5s DLQ drain. stop_grace_period in docker-compose.yaml (and ECS
+# stopTimeout) must stay above this, or SIGKILL lands before the DLQ markers.
 
-def signal_handler(signum, task_producer, shutdown_event):
+
+class ShutdownSignals:
     """
-    Handle shutdown signals (SIGTERM, SIGINT).
-    
-    ECS sends SIGTERM when stopping a task.
-    CTRL+C sends SIGINT during local testing.
+    SIGTERM (ECS / docker stop) or SIGINT (Ctrl+C).
+
+    First signal: graceful shutdown (set the event; run() does the rest).
+    Second signal: forced exit. Cancel main straight away and skip the final
+    save. Safe direction: the marks are older, so a restart sends duplicates, never gaps.
     """
-    logger.info(f"shutdown_handler: Received signal {signum}, initiating graceful shutdown...")
+
+    def __init__(self, shutdown_event, main_task):
+        self.shutdown_event = shutdown_event
+        self.main_task = main_task
+        self.forced = False
+
+    def handle(self, signame):
+        if not self.shutdown_event.is_set():
+            logger.info(f"main: received {signame}, shutting down gracefully (send again to force)")
+            self.shutdown_event.set()
+        elif not self.forced:
+            logger.warning(f"main: received {signame} again, forced exit without the final save")
+            self.forced = True
+            self.main_task.cancel()
+
+    def install(self, loop):
+        for signame in ("SIGINT", "SIGTERM"):
+            loop.add_signal_handler(getattr(signal, signame), self.handle, signame)
+
+
+async def run(shutdown_event, queue, dlq_queue, latest_mark,
+              producer, consumer, timer, dlq_worker, write_marks,
+              drain_timeout=DRAIN_TIMEOUT, dlq_drain_timeout=DLQ_DRAIN_TIMEOUT):
+    """
+    Run the pipeline until a shutdown signal or until any task ends (a crash),
+    then stop everything in order. Returns the exit code: 0 clean, 1 crash.
+
+    Shutdown order, and why:
+      1. cancel the producer      - nothing new enters the queue
+      2. put None on the queue    - after the last record, so nothing is skipped
+      3. wait for the consumer    - drains the queue, at most drain_timeout
+      4. wait for the timer       - an in-flight timer write must finish before the
+                                    final save, or an older mark could land last
+      5. final mark save          - also runs after a crash, marks are still good
+      6. put None on dlq_queue    - only now: producer and consumer are both done,
+                                    so no handoff can come after it
+      7. wait for the DLQ worker  - at most dlq_drain_timeout; leftovers get markers
+    """
+    task_producer = asyncio.create_task(producer, name="producer")
+    task_consumer = asyncio.create_task(consumer, name="consumer")
+    task_timer = asyncio.create_task(timer, name="timer")
+    task_dlq = asyncio.create_task(dlq_worker, name="dlq_worker")
+    tasks = [task_producer, task_consumer, task_timer, task_dlq]
+
+    task_signal = asyncio.create_task(shutdown_event.wait(), name="shutdown_signal")
+    await asyncio.wait([*tasks, task_signal], return_when=asyncio.FIRST_COMPLETED)
+    task_signal.cancel()
+
+    if not shutdown_event.is_set():
+        ended = ", ".join(t.get_name() for t in tasks if t.done())
+        logger.error(f"main: {ended} stopped unexpectedly, shutting down")
+    # Also tells retry() and the timer to stop waiting.
     shutdown_event.set()
+
+    # 1. Stop the producer.
     task_producer.cancel()
+    await asyncio.wait([task_producer])
 
-def is_temporary(exc):
-    if isinstance(exc, BotoCoreError):
-        return True
-
-    if isinstance(exc, ClientError):
-        if exc.response['Error']['Code'] in TEMP_ERROR:
-            return True
-        return False
-
-    return False
-
-async def retry(data, shutdown_event, put_record_kinesis):
-    attempt = 1
-    last_error = None
-    while attempt <= MAX_ATTEMPT:
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=min(2 ** attempt, MAX_WAIT))
-            return False
-        except asyncio.TimeoutError:
-            pass
-
-        try:
-            logger.info(f"retry: Retry attempt {attempt}...")
-            await asyncio.to_thread(put_record_kinesis, data)
-            return True
-        except Exception as e:
-            logger.info(f"retry: Retry attempt {attempt} failed: {e}")
-            if is_temporary(e):
-                attempt += 1
-                last_error = e
-            else:
-                raise
-
-    raise RuntimeError(f"retry: gave up after {MAX_ATTEMPT} tries") from last_error
-
-async def producer(queue, shutdown_event):
-    async def fetch_data(queue, websocket):
-        while True:
-            message = await websocket.recv()
-            logger.info(f"producer: Recieved {message}")
-            json_message = json.loads(message)
-            if json_message[0]["T"] == 't':
-                logger.info(f"producer: Sending message to Queue: {json_message}")
-                for m in json_message:
-                    await queue.put(m)
-
-    uri = f"{AppConfig.alpaca_uri}/test"
-    headers = {
-        "APCA-API-KEY-ID": AppConfig.alpaca_api_key,
-        "APCA-API-SECRET-KEY": AppConfig.alpaca_api_secret
-    }
-    msg = {
-        "action": "subscribe",
-        "trades": LIST_TICKERS
-    }
-    str_dict = json.dumps(msg)
-    bytestring = bytes(str_dict, 'utf-8')
-
+    # 2 + 3. Let the consumer drain, within the deadline.
     try:
-        async for websocket in connect(uri=uri, additional_headers=headers):
-            try:
-                await websocket.send(bytestring)
-                await fetch_data(queue, websocket)
+        async with asyncio.timeout(drain_timeout):
+            if not task_consumer.done():
+                await queue.put(None)
+            await asyncio.wait([task_consumer])
+        logger.info("main: consumer finished")
+    except TimeoutError:
+        logger.error(
+            f"main: consumer did not drain within {drain_timeout}s, "
+            f"{queue.qsize()} records left in the queue (backfill covers them)"
+        )
+        task_consumer.cancel()
+        await asyncio.wait([task_consumer])
 
-            except ConnectionClosed:
-                continue
-    except CancelledError:
-        if shutdown_event.is_set():
-            logger.info("producer: Producer received a shutdown signal, attempt to graceful shutdown...")
-            await queue.put(None)
-        else:
-            logger.info("producer: Someone else cancelled, re raise...")
-            raise
+    # 4. Let an in-flight timer write finish before the final save.
+    await asyncio.wait([task_timer])
 
-async def consumer(
-        queue,
-        shutdown_event,
-        latest_mark,
-        write_dynamodb,
-        put_record_kinesis,
-        save_record_s3
-    ):
-    dlq_counter = 0
-    counter = 0
-    discarding = False
-    while True:
-        data = await queue.get()
-        logger.info(f"consumer: Received message from Queue: {data}")
+    # 5. Final mark save.
+    exit_code = 0
+    try:
+        await asyncio.to_thread(write_marks, latest_mark.copy())
+        logger.info(f"main: final marks saved: {latest_mark}")
+    except Exception as e:
+        logger.error(f"main: final mark save failed ({type(e).__name__}: {e}), restart will resend from older marks")
+        exit_code = 1
 
-        if data is None:
-            try:
-                logger.info("consumer: Attempt to save before shutdown...")
-                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
-            except (ClientError, BotoCoreError) as e:
-                logger.error(f"consumer: Last save failed: {e}")
-            logger.info(f"consumer: Discard count: {counter}")
-            break
+    # 6 + 7. Let the DLQ worker write what's left, within its deadline.
+    try:
+        async with asyncio.timeout(dlq_drain_timeout):
+            if not task_dlq.done():
+                await dlq_queue.put(None)
+            await asyncio.wait([task_dlq])
+        logger.info("main: DLQ worker finished")
+    except TimeoutError:
+        logger.error(f"main: DLQ worker did not finish within {dlq_drain_timeout}s")
+        task_dlq.cancel()
+        await asyncio.wait([task_dlq])
+    # Normally empty. Non-empty after a DLQ timeout or a worker crash.
+    lost = log_unsent(dlq_queue)
+    if lost:
+        logger.error(f"main: {lost} DLQ records were not written, see DLQ_WRITE_FAILED lines")
 
-        if discarding:
-            counter += 1
-            continue
+    for task in tasks:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error(f"main: {task.get_name()} crashed", exc_info=task.exception())
+            exit_code = 1
 
-        try:
-            logger.info(f"consumer: Try to put record to Kinesis: {data}")
-            await asyncio.to_thread(put_record_kinesis, data)
-            latest_mark[data["S"]] = data["t"]
-        except Exception as e:
-            logger.warning(f"consumer: Failed to put record to Kinesis: {e}")
-            if is_temporary(e):
-                status = await retry(data, shutdown_event, put_record_kinesis)
-                if status:
-                    latest_mark[data["S"]] = data["t"]
-                else:
-                    discarding = True
-            elif isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                try:
-                    logger.error(f"consumer: Not a temporary error, logging data to DLQ: {data}")
-                    save_record_s3(data)
-                except (ClientError, Exception) as e:
-                    dlq_counter += 1
-            else:
-                raise
+    logger.info(f"main: shutdown complete, exit code {exit_code}")
+    return exit_code
 
-async def timer(latest_mark, shutdown_event, write_dynamodb):
-    while True:
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=5)
-            break
-        except asyncio.TimeoutError:
-            try:
-                await asyncio.to_thread(write_dynamodb, latest_mark.copy())
-            except ClientError:
-                logger.error("timer: Update to DynamodDB - Client Error")
-                continue
-            except BotoCoreError:
-                logger.error("timer: Update to DynamodDB - Network Error")
-                continue
 
 async def main():
     """
-    Main application entry point.
+    Main application entry point. Returns the process exit code.
     """
+    AppConfig.validate()
+
     session = boto3.session.Session(
         region_name = AppConfig.aws_region,
         aws_access_key_id = AppConfig.aws_access_key_id,
@@ -189,40 +160,31 @@ async def main():
     dynamodb = DynamoDBClient(session)
     kinesis = KinesisClient(session)
     s3 = S3Client(session)
+
     shutdown_event = asyncio.Event()
+    queue = asyncio.Queue(maxsize=QUEUE_SIZE)
+    dlq_queue = asyncio.Queue(maxsize=DLQ_QUEUE_SIZE)
+    latest_mark = dict.fromkeys(TICKERS, "")
 
-    latest_mark = dict.fromkeys(LIST_TICKERS, "")
+    signals = ShutdownSignals(shutdown_event, asyncio.current_task())
+    signals.install(asyncio.get_running_loop())
 
-    queue = asyncio.Queue(maxsize=200)
-    task_producer = asyncio.create_task(producer(queue, shutdown_event))
-    task_consumer = asyncio.create_task(consumer(
-        queue,
-        shutdown_event,
-        latest_mark,
-        dynamodb.put_item,
-        kinesis.put_record,
-        s3.upload_obj
-    ))
-    task_timer = asyncio.create_task(timer(
-        latest_mark,
-        shutdown_event,
-        dynamodb.put_item
-    ))
-
-    loop = asyncio.get_running_loop()
-    
-    for signame in {'SIGINT', 'SIGTERM'}:
-        loop.add_signal_handler(
-            getattr(signal, signame),
-            signal_handler,
-            signame,
-            task_producer,
-            shutdown_event
+    try:
+        return await run(
+            shutdown_event,
+            queue,
+            dlq_queue,
+            latest_mark,
+            producer=producer(queue, dlq_queue),
+            consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kinesis.put_record),
+            timer=timer(latest_mark, shutdown_event, dynamodb.put_item),
+            dlq_worker=dlq_worker(dlq_queue, shutdown_event, s3.put_dlq_record),
+            write_marks=dynamodb.put_item,
         )
-    await asyncio.gather(
-        task_producer,
-        task_consumer,
-        task_timer
-    )
+    except asyncio.CancelledError:
+        if signals.forced:
+            return 1
+        raise
 
-asyncio.run(main())
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

@@ -10,6 +10,7 @@ from botocore.exceptions import (
     ReadTimeoutError,
 )
 
+from errors import RecordRejected, TemporaryError
 from retry import is_temporary
 
 
@@ -46,3 +47,14 @@ def test_network_and_throttling_errors_are_temporary(exc):
 ], ids=lambda e: type(e).__name__ + (f"[{e.response.get('Error', {}).get('Code')}]" if isinstance(e, ClientError) else ""))
 def test_setup_code_and_data_errors_are_permanent(exc):
     assert is_temporary(exc) is False
+
+
+def test_app_temporary_error_is_temporary():
+    # Clients that sort their own library's errors (kafka_client) raise this,
+    # so retry() can retry Kafka faults without importing Kafka.
+    assert is_temporary(TemporaryError("broker not reachable")) is True
+
+
+def test_rejected_record_is_not_temporary():
+    # A rejected record goes to the DLQ. Retrying it would only fail again.
+    assert is_temporary(RecordRejected("record too large")) is False

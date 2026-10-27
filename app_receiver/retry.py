@@ -3,6 +3,7 @@ import asyncio
 from botocore.exceptions import ClientError, HTTPClientError
 from botocore.exceptions import ConnectionError as BotoConnectionError
 
+from errors import TemporaryError
 from logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -22,10 +23,14 @@ TEMP_ERROR = set([
 def is_temporary(exc):
     """
     True when a retry can help: network trouble, or AWS asking us to slow down.
+    Non-AWS clients (kafka_client) sort their own errors and raise TemporaryError.
 
     Every other BotoCoreError (ParamValidationError, NoCredentialsError,
     NoRegionError, ...) is a setup or code fault. Retrying it only delays the crash.
     """
+    if isinstance(exc, TemporaryError):
+        return True
+
     if isinstance(exc, (BotoConnectionError, HTTPClientError)):
         return True
 

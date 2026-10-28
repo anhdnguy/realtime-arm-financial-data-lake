@@ -94,7 +94,7 @@ async def producer(queue, dlq_queue):
     main cancels it at shutdown and then puts the None that stops the consumer.
     Reconnects when the connection drops; crashes on an Alpaca error message.
     """
-    uri = f"{AppConfig.alpaca_uri}/test"
+    uri = f"{AppConfig.alpaca_uri}/iex"
     headers = {
         "APCA-API-KEY-ID": AppConfig.alpaca_api_key,
         "APCA-API-SECRET-KEY": AppConfig.alpaca_api_secret

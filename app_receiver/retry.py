@@ -14,8 +14,7 @@ TEMP_ERROR = set([
     "ThrottlingException", "RequestLimitExceeded", "InternalServerError", # DynamoDB
     "ProvisionedThroughputExceededException", # DynamoDB
     "SlowDown", "InternalError", # S3
-    "RequestTimeout",
-    "ServiceUnavailable"
+    "RequestTimeout", "ServiceUnavailable" # S3
 ])
 
 def is_temporary(exc):

@@ -3,7 +3,11 @@ import os
 from botocore.config import Config
 
 TICKERS = [
-    "FAKEPACA"
+    "AMD", "NVDA", "APP", "AVGO", "MU",
+    "GOOGL", "MSFT", "AMZN", "TSM", "META",
+    "ASML", "PLTR", "ORCL", "DELL", "PANW",
+    "ARM", "CRWD", "KLAC", "ANET", "SAP",
+    "MRVL", "IBM", "ISRG", "NOW", "SNOW"
 ]
 
 # Keep every AWS call short so a hung request can't eat Docker's stop window

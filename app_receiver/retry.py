@@ -11,11 +11,9 @@ logger = setup_logger(__name__)
 MAX_WAIT = 30
 MAX_ATTEMPT = 10
 TEMP_ERROR = set([
-    "ProvisionedThroughputExceededException",
-    "KMSThrottlingException",
-    "InternalFailureException",
-    "SlowDown",
-    "InternalError",
+    "ThrottlingException", "RequestLimitExceeded", "InternalServerError", # DynamoDB
+    "ProvisionedThroughputExceededException", # DynamoDB
+    "SlowDown", "InternalError", # S3
     "RequestTimeout",
     "ServiceUnavailable"
 ])

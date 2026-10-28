@@ -15,6 +15,22 @@ BOTO_CONFIG = Config(
     retries={"total_max_attempts": 2, "mode": "standard"},
 )
 
+# Same job as BOTO_CONFIG, for Kafka: one put_record ends within ~10s, so it fits
+# main.py's 15s drain and stop_grace_period in docker-compose.yaml.
+# - message.timeout.ms: librdkafka retries a record on its own until this runs out
+#   (default 300s), then reports _MSG_TIMED_OUT; our retry() handles the rest.
+#   FLUSH_TIMEOUT in kafka_client must stay above it, or flush returns before the report.
+# - request.timeout.ms / socket.connection.setup.timeout.ms: one hung request or
+#   connect can't use up the whole window (same as BOTO_CONFIG's read/connect timeouts).
+# - enable.idempotence: the broker drops copies made by librdkafka's own retries.
+#   It does not catch resends from our retry() or backfill; container 2 dedupes those.
+KAFKA_PRODUCER_CONFIG = {
+    "enable.idempotence": True,
+    "message.timeout.ms": 10000,
+    "request.timeout.ms": 5000,
+    "socket.connection.setup.timeout.ms": 3000
+}
+
 # AWS_ENDPOINT_URL (LocalStack only) and the AWS keys (ECS uses a task role) may be unset.
 REQUIRED_ENV = [
     "ALPACA_API_KEY",
@@ -49,6 +65,10 @@ class AppConfig:
     stream_name: str = os.getenv("STREAM_NAME")
     table_name: str = os.getenv("DYNAMODB_TABLE_NAME")
     s3_bucket: str = os.getenv("S3_BUCKET")
+
+    # Kafka
+    kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+    kafka_topic: str = os.getenv("KAFKA_TOPIC")
 
     @staticmethod
     def validate(environ=os.environ):

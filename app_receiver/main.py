@@ -4,11 +4,14 @@ import boto3.session
 import signal
 import sys
 
-from config import AppConfig, TICKERS
+# Aliased: producer below is the websocket task that feeds the queue.
+from confluent_kafka import Producer as KafkaProducer
+
+from config import AppConfig, KAFKA_PRODUCER_CONFIG, TICKERS
 from consumer import consumer
 from dlq import DLQ_QUEUE_SIZE, dlq_worker, log_unsent
 from dynamodb_client import DynamoDBClient
-from kinesis_client import KinesisClient
+from kafka_client import KafkaClient
 from logger import setup_logger
 from producer import producer
 from s3_client import S3Client
@@ -158,8 +161,16 @@ async def main():
         aws_secret_access_key = AppConfig.aws_secret_access_key
     )
     dynamodb = DynamoDBClient(session)
-    kinesis = KinesisClient(session)
     s3 = S3Client(session)
+
+    kafka = KafkaClient(
+        KafkaProducer({**KAFKA_PRODUCER_CONFIG, "bootstrap.servers": AppConfig.kafka_bootstrap_servers}),
+        AppConfig.kafka_topic,
+    )
+    # Before any task starts: a missing topic would otherwise look like a broker
+    # outage and be retried for minutes. Blocks for up to METADATA_TIMEOUT, fine
+    # since nothing else is running yet.
+    kafka.check_topic()
 
     shutdown_event = asyncio.Event()
     queue = asyncio.Queue(maxsize=QUEUE_SIZE)
@@ -176,7 +187,7 @@ async def main():
             dlq_queue,
             latest_mark,
             producer=producer(queue, dlq_queue),
-            consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kinesis.put_record),
+            consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kafka.put_record),
             timer=timer(latest_mark, shutdown_event, dynamodb.put_item),
             dlq_worker=dlq_worker(dlq_queue, shutdown_event, s3.put_dlq_record),
             write_marks=dynamodb.put_item,

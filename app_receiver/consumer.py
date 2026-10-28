@@ -1,7 +1,7 @@
-from botocore.exceptions import ClientError
 from functools import partial
 
 from dlq import hand_off
+from errors import RecordRejected
 from logger import setup_logger
 from retry import retry
 
@@ -12,15 +12,19 @@ async def consumer(
         dlq_queue,
         shutdown_event,
         latest_mark,
-        put_record_kinesis
+        put_record
     ):
     """
-    Send each queued trade to Kinesis and advance its ticker's mark.
+    Send each queued trade to Kafka and advance its ticker's mark.
+    put_record returns only after the broker's ack, so the mark never moves
+    past a trade that isn't safely in Kafka.
     Returns on None, which main puts after the last record at shutdown.
 
     If a retry gives up because of shutdown, every later record is discarded
     without a try. The mark must not move past a record that never reached
-    Kinesis, or backfill would skip it.
+    Kafka, or backfill would skip it.
+
+    A rejected record (data fault) goes to the DLQ; any other error crashes.
     """
     counter = 0
     discarding = False
@@ -37,16 +41,13 @@ async def consumer(
             continue
 
         try:
-            logger.debug(f"consumer: Try to put record to Kinesis: {data}")
-            status = await retry(partial(put_record_kinesis, data), shutdown_event)
+            logger.debug(f"consumer: Try to put record to Kafka: {data}")
+            status = await retry(partial(put_record, data), shutdown_event)
             if status:
                 latest_mark[data["S"]] = data["t"]
             else:
                 discarding = True
 
-        except Exception as e:
-            if isinstance(e, ClientError) and e.response['Error']['Code'] == "InvalidArgumentException":
-                logger.warning(f"consumer: Kinesis rejected the record, sending it to the DLQ: {e}")
-                hand_off(dlq_queue, data, e)
-            else:
-                raise
+        except RecordRejected as e:
+            logger.warning(f"consumer: Kafka rejected the record, sending it to the DLQ: {e}")
+            hand_off(dlq_queue, data, e)

@@ -4,10 +4,12 @@ import time
 
 import pytest
 from botocore.exceptions import ClientError
+from confluent_kafka import KafkaError, KafkaException
 
 import timer as timer_module
 from consumer import consumer
 from dlq import dlq_worker
+from errors import RecordRejected
 from main import ShutdownSignals, run
 from timer import timer
 
@@ -33,26 +35,26 @@ class Recorder:
 
 
 class Pipeline:
-    """Builds run() with the real consumer and timer and fake AWS calls."""
+    """Builds run() with the real consumer and timer, and fake Kafka / AWS calls."""
 
-    def __init__(self, kinesis_delay=0.0, kinesis_errors=None, timer_write_delay=0.0, s3_delay=0.0):
+    def __init__(self, send_delay=0.0, send_errors=None, timer_write_delay=0.0, s3_delay=0.0):
         self.shutdown = asyncio.Event()
         self.queue = asyncio.Queue(maxsize=200)
         self.dlq_queue = asyncio.Queue(maxsize=100)
         self.s3_delay = s3_delay
         self.marks = {"FAKEPACA": ""}
         self.log = Recorder()
-        self.kinesis_delay = kinesis_delay
-        self.kinesis_errors = kinesis_errors or {}
+        self.send_delay = send_delay
+        self.send_errors = send_errors or {}
         self.timer_write_delay = timer_write_delay
-        self.kinesis_calls = 0
+        self.send_calls = 0
 
     def put_record(self, data):
-        self.kinesis_calls += 1
-        time.sleep(self.kinesis_delay)
-        if self.kinesis_calls in self.kinesis_errors:
-            raise self.kinesis_errors[self.kinesis_calls]
-        self.log.add("kinesis", data["t"])
+        self.send_calls += 1
+        time.sleep(self.send_delay)
+        if self.send_calls in self.send_errors:
+            raise self.send_errors[self.send_calls]
+        self.log.add("kafka", data["t"])
 
     def timer_write(self, marks):
         self.log.add("timer_write_start", marks["FAKEPACA"])
@@ -100,7 +102,7 @@ def slow_timer(monkeypatch):
 
 
 async def test_graceful_stop_drains_queue_then_saves_last():
-    p = Pipeline(kinesis_delay=0.02)
+    p = Pipeline(send_delay=0.02)
     trades = [trade(n) for n in range(5)]
     # Shutdown starts while most trades are still queued.
     stop_after(p.shutdown, 0.03)
@@ -108,17 +110,17 @@ async def test_graceful_stop_drains_queue_then_saves_last():
     code = await asyncio.wait_for(p.run(feed(p.queue, trades)), timeout=5)
 
     assert code == 0
-    assert [e for e in p.log.events if e[0] == "kinesis"] == [("kinesis", t["t"]) for t in trades]
+    assert [e for e in p.log.events if e[0] == "kafka"] == [("kafka", t["t"]) for t in trades]
     assert p.log.events[-1] == ("final_save", trades[-1]["t"])
 
 
 async def test_consumer_crash_still_saves_marks_and_exits_1():
-    p = Pipeline(kinesis_errors={2: client_error("AccessDeniedException")})
+    p = Pipeline(send_errors={2: KafkaException(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED))})
 
     code = await asyncio.wait_for(p.run(feed(p.queue, [trade(0), trade(1), trade(2)])), timeout=5)
 
     assert code == 1
-    # Mark stops at the last record that reached Kinesis.
+    # Mark stops at the last record that reached Kafka.
     assert p.log.events[-1] == ("final_save", trade(0)["t"])
 
 
@@ -133,12 +135,12 @@ async def test_producer_crash_still_saves_marks_and_exits_1():
     code = await asyncio.wait_for(p.run(broken_producer()), timeout=5)
 
     assert code == 1
-    assert ("kinesis", trade(0)["t"]) in p.log.events
+    assert ("kafka", trade(0)["t"]) in p.log.events
     assert p.log.events[-1] == ("final_save", trade(0)["t"])
 
 
 async def test_drain_deadline_cancels_consumer_and_still_saves(caplog):
-    p = Pipeline(kinesis_delay=0.2)
+    p = Pipeline(send_delay=0.2)
     stop_after(p.shutdown, 0.01)
     started = time.monotonic()
 
@@ -182,7 +184,7 @@ async def test_failed_final_save_exits_1():
 async def test_record_rejected_during_drain_still_reaches_the_dlq():
     # The last trade is rejected while the queue drains, after shutdown started.
     # The DLQ None must come after that handoff, or the record is silently lost.
-    p = Pipeline(kinesis_delay=0.02, kinesis_errors={5: client_error("InvalidArgumentException")})
+    p = Pipeline(send_delay=0.02, send_errors={5: RecordRejected("record too large")})
     trades = [trade(n) for n in range(5)]
     stop_after(p.shutdown, 0.01)
 
@@ -190,12 +192,12 @@ async def test_record_rejected_during_drain_still_reaches_the_dlq():
 
     assert code == 0
     assert ("dlq", trades[-1]["t"]) in p.log.events
-    # The rejected trade never reached Kinesis, so the mark stays on the one before it.
+    # The rejected trade never reached Kafka, so the mark stays on the one before it.
     assert ("final_save", trades[-2]["t"]) in p.log.events
 
 
 async def test_dlq_drain_deadline_logs_a_marker_for_every_unwritten_record(caplog):
-    p = Pipeline(kinesis_errors={n: client_error("InvalidArgumentException") for n in range(1, 4)}, s3_delay=0.3)
+    p = Pipeline(send_errors={n: RecordRejected("record too large") for n in range(1, 4)}, s3_delay=0.3)
     stop_after(p.shutdown, 0.05)
 
     code = await asyncio.wait_for(p.run(feed(p.queue, [trade(n) for n in range(3)]), dlq_drain_timeout=0.1), timeout=5)

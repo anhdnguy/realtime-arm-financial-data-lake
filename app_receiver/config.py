@@ -28,11 +28,17 @@ BOTO_CONFIG = Config(
 #   connect can't use up the whole window (same as BOTO_CONFIG's read/connect timeouts).
 # - enable.idempotence: the broker drops copies made by librdkafka's own retries.
 #   It does not catch resends from our retry() or backfill; container 2 dedupes those.
+# - acks: the broker confirms a record only once it is in the log of every in-sync
+#   replica (here: the one broker). The consumer moves a mark only after that
+#   confirmation, so this is what keeps a crash from leaving gaps. Already the
+#   librdkafka default, and idempotence requires it (any other value fails at
+#   startup); set here so the guarantee is visible.
 KAFKA_PRODUCER_CONFIG = {
     "enable.idempotence": True,
     "message.timeout.ms": 10000,
     "request.timeout.ms": 5000,
-    "socket.connection.setup.timeout.ms": 3000
+    "socket.connection.setup.timeout.ms": 3000,
+    "acks": "all",
 }
 
 # AWS_ENDPOINT_URL (LocalStack only) and the AWS keys (ECS uses a task role) may be unset.

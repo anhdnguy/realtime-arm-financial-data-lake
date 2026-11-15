@@ -90,6 +90,11 @@ def test_flush_waits_longer_than_the_message_timeout():
     assert FLUSH_TIMEOUT * 1000 > KAFKA_PRODUCER_CONFIG["message.timeout.ms"]
 
 
+def test_broker_confirms_only_after_every_in_sync_replica_has_the_record():
+    # The mark moves only after the confirmation, so a weaker acks could leave gaps.
+    assert KAFKA_PRODUCER_CONFIG["acks"] == "all"
+
+
 # --- put_record: data fault -> RecordRejected (DLQ) -----------------------
 
 def test_too_large_at_produce_is_rejected():

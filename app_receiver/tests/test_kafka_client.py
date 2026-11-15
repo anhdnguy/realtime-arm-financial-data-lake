@@ -65,16 +65,17 @@ def kafka_code(exc):
 
 # --- put_record: success --------------------------------------------------
 
-def test_good_trade_goes_to_the_topic_keyed_by_ticker():
+def test_record_goes_to_the_topic_with_the_given_key():
+    # The caller picks the key (trades: the ticker; heartbeats: "receiver"),
+    # so a key that differs from the data proves it isn't read from the record.
     producer = FakeProducer()
 
-    KafkaClient(producer, TOPIC).put_record(trade())
+    KafkaClient(producer, TOPIC).put_record("some-key", trade())
 
     [record] = producer.sent
     assert record.topic == TOPIC
-    # Key = ticker, so each ticker stays on one partition, in order.
     key = record.key.decode() if isinstance(record.key, bytes) else record.key
-    assert key == "FAKEPACA"
+    assert key == "some-key"
     assert json.loads(record.value) == trade()
 
 
@@ -83,7 +84,7 @@ def test_flush_waits_longer_than_the_message_timeout():
     # flush never returns with a record still in the buffer (unless the setup is wrong).
     producer = FakeProducer()
 
-    KafkaClient(producer, TOPIC).put_record(trade())
+    KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert producer.flush_timeouts == [FLUSH_TIMEOUT]
     assert FLUSH_TIMEOUT * 1000 > KAFKA_PRODUCER_CONFIG["message.timeout.ms"]
@@ -97,7 +98,7 @@ def test_too_large_at_produce_is_rejected():
     producer = FakeProducer(produce_error=original)
 
     with pytest.raises(RecordRejected) as info:
-        KafkaClient(producer, TOPIC).put_record(trade())
+        KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert info.value.__cause__ is original
 
@@ -107,7 +108,7 @@ def test_too_large_in_delivery_report_is_rejected():
     producer = FakeProducer(delivery_error=KafkaError(KafkaError.MSG_SIZE_TOO_LARGE))
 
     with pytest.raises(RecordRejected) as info:
-        KafkaClient(producer, TOPIC).put_record(trade())
+        KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert kafka_code(info.value.__cause__) == KafkaError.MSG_SIZE_TOO_LARGE
 
@@ -123,7 +124,7 @@ def test_timeouts_and_retriable_errors_are_temporary(error):
     producer = FakeProducer(delivery_error=error)
 
     with pytest.raises(TemporaryError) as info:
-        KafkaClient(producer, TOPIC).put_record(trade())
+        KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert kafka_code(info.value.__cause__) == error.code()
     assert is_temporary(info.value)
@@ -135,7 +136,7 @@ def test_other_errors_come_through_unchanged():
     producer = FakeProducer(delivery_error=KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED))
 
     with pytest.raises(KafkaException) as info:
-        KafkaClient(producer, TOPIC).put_record(trade())
+        KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert kafka_code(info.value) == KafkaError.TOPIC_AUTHORIZATION_FAILED
     assert not is_temporary(info.value)
@@ -148,7 +149,7 @@ def test_record_still_unconfirmed_after_flush_crashes():
     producer = FakeProducer(unconfirmed=True)
 
     with pytest.raises(Exception) as info:
-        KafkaClient(producer, TOPIC).put_record(trade())
+        KafkaClient(producer, TOPIC).put_record("FAKEPACA", trade())
 
     assert not isinstance(info.value, (TemporaryError, RecordRejected))
     assert not is_temporary(info.value)

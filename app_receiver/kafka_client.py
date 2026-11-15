@@ -36,8 +36,12 @@ def raise_sorted(original):
 
 class KafkaClient:
     """
-    Sends one trade at a time and waits for the broker's ack before returning, so
+    Sends one record at a time and waits for the broker's ack before returning, so
     the consumer only moves a ticker's mark after the trade is safely in Kafka.
+
+    One KafkaClient per producer per sender: two threads flushing the same producer
+    can run each other's delivery callbacks, and put_record would then find no
+    report for its own record. So the heartbeat gets its own producer.
 
     Takes a ready-made producer (a confluent_kafka.Producer built with
     KAFKA_PRODUCER_CONFIG), so tests can pass a fake.
@@ -47,18 +51,21 @@ class KafkaClient:
         self.producer = producer
         self.topic = topic
 
-    def put_record(self, data):
+    def put_record(self, key, data):
         """
-        Blocking: runs in a thread via retry(). Returns once the broker has the record.
+        Blocking: runs in a thread. Returns once the broker has the record.
 
-        The delivery callback runs inside flush(), on this same thread, so a plain
-        local list is enough to carry the result out.
+        key picks the partition: records with the same key stay on one partition,
+        in order (trades: the ticker; heartbeats: "receiver").
+
+        The delivery callback runs inside flush(), on this same thread (this
+        producer has no other sender), so a plain local list carries the result out.
         """
         reports = []
         try:
             self.producer.produce(
                 self.topic,
-                key=data["S"],  # one ticker -> one partition, kept in order
+                key=key,
                 value=json.dumps(data).encode("utf-8"),
                 on_delivery=lambda error, msg: reports.append(error),
             )

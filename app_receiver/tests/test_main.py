@@ -48,8 +48,10 @@ class Pipeline:
         self.send_errors = send_errors or {}
         self.timer_write_delay = timer_write_delay
         self.send_calls = 0
+        self.keys = []
 
-    def put_record(self, data):
+    def put_record(self, key, data):
+        self.keys.append(key)
         self.send_calls += 1
         time.sleep(self.send_delay)
         if self.send_calls in self.send_errors:
@@ -112,6 +114,17 @@ async def test_graceful_stop_drains_queue_then_saves_last():
     assert code == 0
     assert [e for e in p.log.events if e[0] == "kafka"] == [("kafka", t["t"]) for t in trades]
     assert p.log.events[-1] == ("final_save", trades[-1]["t"])
+
+
+async def test_consumer_keys_each_trade_by_its_ticker():
+    # Key = ticker, so each ticker stays on one partition, in order.
+    p = Pipeline()
+    trades = [dict(trade(0), S="AAA"), dict(trade(1), S="BBB")]
+    stop_after(p.shutdown, 0.05)
+
+    await asyncio.wait_for(p.run(feed(p.queue, trades)), timeout=5)
+
+    assert p.keys == ["AAA", "BBB"]
 
 
 async def test_consumer_crash_still_saves_marks_and_exits_1():

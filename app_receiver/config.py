@@ -32,7 +32,8 @@ KAFKA_PRODUCER_CONFIG = {
     "enable.idempotence": True,
     "message.timeout.ms": 10000,
     "request.timeout.ms": 5000,
-    "socket.connection.setup.timeout.ms": 3000
+    "socket.connection.setup.timeout.ms": 3000,
+    "ack": "all" # With idempotence on, librdkafka uses all regardless.
 }
 
 # AWS_ENDPOINT_URL (LocalStack only) and the AWS keys (ECS uses a task role) may be unset.

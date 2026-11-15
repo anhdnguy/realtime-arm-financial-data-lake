@@ -5,6 +5,7 @@ services:
   broker:
     image: *kafka-image
     container_name: broker
+    restart: unless-stopped # comes back after a crash or reboot, and a manual stop stays stopped.
     ports:
       - "9092:9092"  # EXTERNAL listener, for tools on the host
     environment:
@@ -67,6 +68,7 @@ services:
       dockerfile: Dockerfile
     image: streaming-arm/python:3.13-slim
     stop_grace_period: 45s  # must exceed the worst-case shutdown in app_receiver/main.py
+    restart: unless-stopped # comes back after a crash or reboot, and a manual stop stays stopped.
     depends_on:
       broker:
         condition: service_healthy

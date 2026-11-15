@@ -70,7 +70,7 @@ class Pipeline:
         time.sleep(self.s3_delay)
         self.log.add("dlq", raw["t"])
 
-    async def run(self, producer, drain_timeout=5, dlq_drain_timeout=5):
+    async def run(self, producer, heartbeat=None, drain_timeout=5, dlq_drain_timeout=5):
         return await run(
             self.shutdown,
             self.queue,
@@ -80,6 +80,8 @@ class Pipeline:
             consumer=consumer(self.queue, self.dlq_queue, self.shutdown, self.marks, self.put_record),
             timer=timer(self.marks, self.shutdown, self.timer_write),
             dlq_worker=dlq_worker(self.dlq_queue, self.shutdown, self.s3_write),
+            # Default: beats forever (never ends on its own) until main cancels it.
+            heartbeat=heartbeat or asyncio.Event().wait(),
             write_marks=self.final_write,
             drain_timeout=drain_timeout,
             dlq_drain_timeout=dlq_drain_timeout,
@@ -150,6 +152,41 @@ async def test_producer_crash_still_saves_marks_and_exits_1():
     assert code == 1
     assert ("kafka", trade(0)["t"]) in p.log.events
     assert p.log.events[-1] == ("final_save", trade(0)["t"])
+
+
+async def test_heartbeat_crash_shuts_down_in_order_and_exits_1(caplog):
+    # Like any task: the heartbeat ending means a bug or a setup fault.
+    p = Pipeline()
+
+    async def broken_heartbeat():
+        await asyncio.sleep(0.05)
+        raise KafkaException(KafkaError(KafkaError.TOPIC_AUTHORIZATION_FAILED))
+
+    code = await asyncio.wait_for(p.run(feed(p.queue, [trade(0)]), heartbeat=broken_heartbeat()), timeout=5)
+
+    assert code == 1
+    assert "heartbeat stopped unexpectedly" in caplog.text
+    assert p.log.events[-1] == ("final_save", trade(0)["t"])
+
+
+async def test_graceful_stop_cancels_the_heartbeat_and_exits_0():
+    p = Pipeline()
+    beats = []
+
+    async def beating():
+        while True:
+            beats.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    stop_after(p.shutdown, 0.05)
+
+    code = await asyncio.wait_for(p.run(feed(p.queue, []), heartbeat=beating()), timeout=5)
+    count = len(beats)
+    await asyncio.sleep(0.05)
+
+    assert code == 0
+    assert count >= 2
+    assert len(beats) == count  # no beats after shutdown
 
 
 async def test_drain_deadline_cancels_consumer_and_still_saves(caplog):

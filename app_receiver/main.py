@@ -3,6 +3,7 @@ import boto3
 import boto3.session
 import signal
 import sys
+from datetime import datetime, timezone
 
 # Aliased: producer below is the websocket task that feeds the queue.
 from confluent_kafka import Producer as KafkaProducer
@@ -11,6 +12,7 @@ from config import AppConfig, KAFKA_PRODUCER_CONFIG, TICKERS
 from consumer import consumer
 from dlq import DLQ_QUEUE_SIZE, dlq_worker, log_unsent
 from dynamodb_client import DynamoDBClient
+from heartbeat import heartbeat, utc_text
 from kafka_client import KafkaClient
 from logger import setup_logger
 from producer import producer
@@ -60,7 +62,7 @@ class ShutdownSignals:
 
 
 async def run(shutdown_event, queue, dlq_queue, latest_mark,
-              producer, consumer, timer, dlq_worker, write_marks,
+              producer, consumer, timer, dlq_worker, heartbeat, write_marks,
               drain_timeout=DRAIN_TIMEOUT, dlq_drain_timeout=DLQ_DRAIN_TIMEOUT):
     """
     Run the pipeline until a shutdown signal or until any task ends (a crash),
@@ -68,6 +70,8 @@ async def run(shutdown_event, queue, dlq_queue, latest_mark,
 
     Shutdown order, and why:
       1. cancel the producer      - nothing new enters the queue
+         and the heartbeat          (no "stopping" beat: after a stop, the
+                                    watcher saying "receiver down" is true)
       2. put None on the queue    - after the last record, so nothing is skipped
       3. wait for the consumer    - drains the queue, at most drain_timeout
       4. wait for the timer       - an in-flight timer write must finish before the
@@ -81,7 +85,8 @@ async def run(shutdown_event, queue, dlq_queue, latest_mark,
     task_consumer = asyncio.create_task(consumer, name="consumer")
     task_timer = asyncio.create_task(timer, name="timer")
     task_dlq = asyncio.create_task(dlq_worker, name="dlq_worker")
-    tasks = [task_producer, task_consumer, task_timer, task_dlq]
+    task_heartbeat = asyncio.create_task(heartbeat, name="heartbeat")
+    tasks = [task_producer, task_consumer, task_timer, task_dlq, task_heartbeat]
 
     task_signal = asyncio.create_task(shutdown_event.wait(), name="shutdown_signal")
     await asyncio.wait([*tasks, task_signal], return_when=asyncio.FIRST_COMPLETED)
@@ -93,9 +98,11 @@ async def run(shutdown_event, queue, dlq_queue, latest_mark,
     # Also tells retry() and the timer to stop waiting.
     shutdown_event.set()
 
-    # 1. Stop the producer.
+    # 1. Stop the producer and the heartbeat. A beat already in its thread still
+    # finishes (at most FLUSH_TIMEOUT, 12s), well inside stop_grace_period.
     task_producer.cancel()
-    await asyncio.wait([task_producer])
+    task_heartbeat.cancel()
+    await asyncio.wait([task_producer, task_heartbeat])
 
     # 2 + 3. Let the consumer drain, within the deadline.
     try:
@@ -153,6 +160,8 @@ async def main():
     """
     Main application entry point. Returns the process exit code.
     """
+    # Changes on every restart: the watcher counts restarts from it.
+    started_at = utc_text(datetime.now(timezone.utc))
     AppConfig.validate()
 
     session = boto3.session.Session(
@@ -163,10 +172,11 @@ async def main():
     dynamodb = DynamoDBClient(session)
     s3 = S3Client(session)
 
-    # One producer (one broker connection) shared by both topics.
-    kafka_producer = KafkaProducer({**KAFKA_PRODUCER_CONFIG, "bootstrap.servers": AppConfig.kafka_bootstrap_servers})
-    kafka = KafkaClient(kafka_producer, AppConfig.kafka_topic)
-    heartbeat_kafka = KafkaClient(kafka_producer, AppConfig.kafka_heartbeat_topic)
+    # One producer per sender: two threads flushing a shared producer can run each
+    # other's delivery callbacks (see KafkaClient).
+    producer_config = {**KAFKA_PRODUCER_CONFIG, "bootstrap.servers": AppConfig.kafka_bootstrap_servers}
+    kafka = KafkaClient(KafkaProducer(producer_config), AppConfig.kafka_topic)
+    heartbeat_kafka = KafkaClient(KafkaProducer(producer_config), AppConfig.kafka_heartbeat_topic)
     # Before any task starts: a missing topic would otherwise look like a broker
     # outage and be retried for minutes. Blocks for up to METADATA_TIMEOUT each, fine
     # since nothing else is running yet. The heartbeat topic too: heartbeat sends
@@ -178,6 +188,8 @@ async def main():
     queue = asyncio.Queue(maxsize=QUEUE_SIZE)
     dlq_queue = asyncio.Queue(maxsize=DLQ_QUEUE_SIZE)
     latest_mark = dict.fromkeys(TICKERS, "")
+    # Shared like latest_mark: the producer writes it, the heartbeat reads it.
+    alpaca_status = {"last_message_at": None}
 
     signals = ShutdownSignals(shutdown_event, asyncio.current_task())
     signals.install(asyncio.get_running_loop())
@@ -188,10 +200,11 @@ async def main():
             queue,
             dlq_queue,
             latest_mark,
-            producer=producer(queue, dlq_queue),
+            producer=producer(queue, dlq_queue, alpaca_status),
             consumer=consumer(queue, dlq_queue, shutdown_event, latest_mark, kafka.put_record),
             timer=timer(latest_mark, shutdown_event, dynamodb.put_item),
             dlq_worker=dlq_worker(dlq_queue, shutdown_event, s3.put_dlq_record),
+            heartbeat=heartbeat(started_at, alpaca_status, heartbeat_kafka.put_record),
             write_marks=dynamodb.put_item,
         )
     except asyncio.CancelledError:

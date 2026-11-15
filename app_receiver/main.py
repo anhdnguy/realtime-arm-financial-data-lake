@@ -163,14 +163,16 @@ async def main():
     dynamodb = DynamoDBClient(session)
     s3 = S3Client(session)
 
-    kafka = KafkaClient(
-        KafkaProducer({**KAFKA_PRODUCER_CONFIG, "bootstrap.servers": AppConfig.kafka_bootstrap_servers}),
-        AppConfig.kafka_topic,
-    )
+    # One producer (one broker connection) shared by both topics.
+    kafka_producer = KafkaProducer({**KAFKA_PRODUCER_CONFIG, "bootstrap.servers": AppConfig.kafka_bootstrap_servers})
+    kafka = KafkaClient(kafka_producer, AppConfig.kafka_topic)
+    heartbeat_kafka = KafkaClient(kafka_producer, AppConfig.kafka_heartbeat_topic)
     # Before any task starts: a missing topic would otherwise look like a broker
-    # outage and be retried for minutes. Blocks for up to METADATA_TIMEOUT, fine
-    # since nothing else is running yet.
+    # outage and be retried for minutes. Blocks for up to METADATA_TIMEOUT each, fine
+    # since nothing else is running yet. The heartbeat topic too: heartbeat sends
+    # are dropped on failure, so a missing topic would only ever show up as a WARNING.
     kafka.check_topic()
+    heartbeat_kafka.check_topic()
 
     shutdown_event = asyncio.Event()
     queue = asyncio.Queue(maxsize=QUEUE_SIZE)

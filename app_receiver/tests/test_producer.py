@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import pytest
 from websockets.exceptions import ConnectionClosedOK
@@ -15,6 +16,10 @@ def trade(n, **overrides):
 
 def frame(*messages):
     return json.dumps(list(messages))
+
+
+def alpaca_status():
+    return {"last_message_at": None}
 
 
 # --- Backoff -----
@@ -154,7 +159,7 @@ async def test_forward_frames_routes_trades_and_bad_records():
     )
 
     with pytest.raises(ConnectionClosedOK):
-        await forward_frames(ws, queue, dlq_queue, backoff)
+        await forward_frames(ws, queue, dlq_queue, backoff, alpaca_status())
 
     assert [queue.get_nowait() for _ in range(queue.qsize())] == [trade(0), trade(1)]
     assert [r for r, _ in [dlq_queue.get_nowait() for _ in range(dlq_queue.qsize())]] == [trade(0, S=None), "not json"]
@@ -165,9 +170,28 @@ async def test_forward_frames_crashes_on_alpaca_error():
     ws = FakeWebsocket(frame({"T": "error", "code": 402, "msg": "auth failed"}), frame(trade(0)))
 
     with pytest.raises(AlpacaError):
-        await forward_frames(ws, queue, dlq_queue, backoff)
+        await forward_frames(ws, queue, dlq_queue, backoff, alpaca_status())
 
     assert queue.empty()
+
+
+@pytest.mark.parametrize("raw", [
+    frame({"T": "success", "msg": "connected"}),
+    frame(trade(0)),
+    "not json",
+    frame({"T": "error", "code": 406, "msg": "connection limit exceeded"}),
+], ids=["control", "trade", "bad_json", "alpaca_error"])
+async def test_forward_frames_any_frame_updates_last_message_time(raw):
+    # Any frame shows the connection delivers, even one that is bad or an error.
+    queue, dlq_queue, backoff, status = asyncio.Queue(), asyncio.Queue(), Backoff(), alpaca_status()
+    before = datetime.now(timezone.utc)
+
+    with pytest.raises((ConnectionClosedOK, AlpacaError)):
+        await forward_frames(FakeWebsocket(raw), queue, dlq_queue, backoff, status)
+
+    assert status["last_message_at"] is not None
+    assert status["last_message_at"] >= before
+    assert status["last_message_at"].tzinfo is not None  # UTC, not local time
 
 
 async def test_forward_frames_reset_backoff_when_reconnect_successfully():
@@ -181,7 +205,7 @@ async def test_forward_frames_reset_backoff_when_reconnect_successfully():
     backoff.next_wait()
 
     with pytest.raises(ConnectionClosedOK):
-        await forward_frames(ws, queue, dlq_queue, backoff)
+        await forward_frames(ws, queue, dlq_queue, backoff, alpaca_status())
 
     assert backoff.next_wait() == 2
 
@@ -195,6 +219,6 @@ async def test_backoff_authenticated_and_subscription_arrives_in_same_frame():
     backoff.next_wait()
     
     with pytest.raises(ConnectionClosedOK):
-        await forward_frames(ws, queue, dlq_queue, backoff)
+        await forward_frames(ws, queue, dlq_queue, backoff, alpaca_status())
 
     assert backoff.next_wait() == 2

@@ -5,6 +5,7 @@ services:
   broker:
     image: *kafka-image
     container_name: broker
+    restart: unless-stopped # comes back after a crash or reboot, and a manual stop stays stopped.
     ports:
       - "9092:9092"  # EXTERNAL listener, for tools on the host
     environment:
@@ -42,21 +43,25 @@ services:
     networks:
       - shared-network
 
-  # One-off job: creates the topic, then exits 0. Safe to rerun (--if-not-exists).
-  # Partition count is fixed here; adding partitions later moves tickers to new partitions.
+  # One-off job: creates the topics, then exits 0. Safe to rerun (--if-not-exists),
+  # but a rerun never changes an existing topic's settings.
+  # trades: partition count is fixed here; adding partitions later moves tickers to new partitions.
+  # heartbeat: 1 partition, so the watcher reads beats in order; kept 1 day, it's only a liveness signal.
+  # set -e: if the first create fails, the job exits non-zero and the receiver never starts.
   kafka-init:
     image: *kafka-image
     depends_on:
       broker:
         condition: service_healthy
-    entrypoint: ["/opt/kafka/bin/kafka-topics.sh"]
+    entrypoint: ["/bin/sh", "-c"]
     command:
-      - --bootstrap-server=broker:29092
-      - --create
-      - --if-not-exists
-      - --topic=${KAFKA_TOPIC:-trades}
-      - --partitions=3
-      - --replication-factor=1
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server=broker:29092 --create --if-not-exists \
+          --topic=${KAFKA_TOPIC:-trades} --partitions=3 --replication-factor=1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server=broker:29092 --create --if-not-exists \
+          --topic=${KAFKA_HEARTBEAT_TOPIC:-heartbeat} --partitions=1 --replication-factor=1 \
+          --config retention.ms=86400000
     restart: "no"
     networks:
       - shared-network
@@ -67,6 +72,7 @@ services:
       dockerfile: Dockerfile
     image: streaming-arm/python:3.13-slim
     stop_grace_period: 45s  # must exceed the worst-case shutdown in app_receiver/main.py
+    restart: unless-stopped # comes back after a crash or reboot, and a manual stop stays stopped.
     depends_on:
       broker:
         condition: service_healthy
@@ -82,6 +88,7 @@ services:
       AWS_REGION: ${AWS_REGION}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-broker:29092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}  # same default as kafka-init, so they can't drift
+      KAFKA_HEARTBEAT_TOPIC: ${KAFKA_HEARTBEAT_TOPIC:-heartbeat}  # same here
       DYNAMODB_TABLE_NAME: ${DYNAMODB_TABLE_NAME}
       S3_BUCKET: ${S3_BUCKET}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

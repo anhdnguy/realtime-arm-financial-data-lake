@@ -33,6 +33,10 @@ def test_kafka_settings_are_required_and_kinesis_ones_are_gone():
     assert "STREAM_NAME" not in REQUIRED_ENV
 
 
+def test_heartbeat_topic_is_required():
+    assert "KAFKA_HEARTBEAT_TOPIC" in REQUIRED_ENV
+
+
 def test_optional_vars_are_not_required():
     for name in ["AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]:
         assert name not in REQUIRED_ENV

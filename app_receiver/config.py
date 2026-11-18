@@ -32,7 +32,8 @@ KAFKA_PRODUCER_CONFIG = {
     "enable.idempotence": True,
     "message.timeout.ms": 10000,
     "request.timeout.ms": 5000,
-    "socket.connection.setup.timeout.ms": 3000
+    "socket.connection.setup.timeout.ms": 3000,
+    "ack": "all" # With idempotence on, librdkafka uses all regardless.
 }
 
 # AWS_ENDPOINT_URL (LocalStack only) and the AWS keys (ECS uses a task role) may be unset.
@@ -45,6 +46,7 @@ REQUIRED_ENV = [
     "S3_BUCKET",
     "KAFKA_BOOTSTRAP_SERVERS",
     "KAFKA_TOPIC",
+    "KAFKA_HEARTBEAT_TOPIC",
 ]
 
 
@@ -71,6 +73,8 @@ class AppConfig:
     # Kafka (the trade stream)
     kafka_bootstrap_servers: str = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
     kafka_topic: str = os.getenv("KAFKA_TOPIC")
+    # Liveness signal for the watcher, kept off the trades topic so container 2 never sees it.
+    kafka_heartbeat_topic: str = os.getenv("KAFKA_HEARTBEAT_TOPIC")
 
     @staticmethod
     def validate(environ=os.environ):

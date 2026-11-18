@@ -42,7 +42,8 @@ async def consumer(
 
         try:
             logger.debug(f"consumer: Try to put record to Kafka: {data}")
-            status = await retry(partial(put_record, data), shutdown_event)
+            # Key = ticker: one ticker -> one partition, kept in order.
+            status = await retry(partial(put_record, data["S"], data), shutdown_event)
             if status:
                 latest_mark[data["S"]] = data["t"]
             else:

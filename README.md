@@ -15,12 +15,12 @@ Prerequisites:
 - the external network: `docker network create shared-network`
 - LocalStack running, with the DynamoDB table and S3 bucket created
 - a `.env` file with `ALPACA_API_KEY`, `ALPACA_API_SECRET`, `ALPACA_URI`, `AWS_ENDPOINT_URL`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `DYNAMODB_TABLE_NAME`, `S3_BUCKET`
-  (`KAFKA_BOOTSTRAP_SERVERS` and `KAFKA_TOPIC` are optional, defaults `broker:29092` and `trades`)
+  (`KAFKA_BOOTSTRAP_SERVERS`, `KAFKA_TOPIC` and `KAFKA_HEARTBEAT_TOPIC` are optional, defaults `broker:29092`, `trades` and `heartbeat`)
 
 ```bash
 docker compose up --build receiver
 ```
-Starts the Kafka broker and creates the topic first.
+Starts the Kafka broker and creates both topics first.
 
 ### Check it works
 Watch trades arrive (ticker, then the trade):

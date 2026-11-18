@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
@@ -104,14 +105,17 @@ def parse_frame(raw):
     return trades, bad, authenticated
 
 
-async def forward_frames(websocket, queue, dlq_queue, backoff):
+async def forward_frames(websocket, queue, dlq_queue, backoff, alpaca_status):
     """
     Read frames until the connection closes: trades to the queue, bad records to the DLQ.
     Resets the backoff on "authenticated". A 406 arrives before it, so a refused
     connection never resets the wait.
+    Every frame sets alpaca_status["last_message_at"] (read by the heartbeat), before
+    parsing, so a bad frame or an error frame counts too: the connection delivered.
     """
     while True:
         frame = await websocket.recv()
+        alpaca_status["last_message_at"] = datetime.now(timezone.utc)
         logger.debug(f"producer: Received {frame}")
         trades, bad, authenticated = parse_frame(frame)
         if authenticated:
@@ -123,9 +127,10 @@ async def forward_frames(websocket, queue, dlq_queue, backoff):
             await queue.put(trade)
 
 
-async def producer(queue, dlq_queue):
+async def producer(queue, dlq_queue, alpaca_status):
     """
     Stream trades from Alpaca into the queue until cancelled.
+    Keeps alpaca_status["last_message_at"] up to date for the heartbeat.
     main cancels it at shutdown and then puts the None that stops the consumer.
     Reconnects when the connection drops, after a wait from Backoff;
     crashes on an Alpaca error message.
@@ -147,7 +152,7 @@ async def producer(queue, dlq_queue):
     async for websocket in connect(uri=uri, additional_headers=headers):
         try:
             await websocket.send(bytestring)
-            await forward_frames(websocket, queue, dlq_queue, backoff)
+            await forward_frames(websocket, queue, dlq_queue, backoff, alpaca_status)
 
         except ConnectionClosed:
             wait_time = backoff.next_wait()

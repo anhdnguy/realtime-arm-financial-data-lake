@@ -33,3 +33,16 @@ Run the tests (they run in Docker):
 ```bash
 ./run_tests.sh
 ```
+
+## Watcher
+Reads the receiver's heartbeats (one a minute on the `heartbeat` topic) and logs a line starting with `ALERT` when:
+- the broker can't be reached,
+- the broker is fine but no heartbeat came for 3 minutes (receiver down),
+- the receiver started 3 or more times within 15 minutes (crash loop).
+
+When the problem ends it logs a `CLEARED` line. Every live heartbeat also logs one "receiver alive" line.
+
+```bash
+docker compose up -d --build watcher
+docker compose logs watcher | grep -E "ALERT|CLEARED"
+```

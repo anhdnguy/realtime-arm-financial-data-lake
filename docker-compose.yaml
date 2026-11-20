@@ -95,6 +95,21 @@ services:
     networks:
       - shared-network
 
+  # Reads the receiver's heartbeats and logs ALERT lines (rules in app_watcher/rules.py).
+  # No depends_on: it has to start, and report, even when the broker is down.
+  watcher:
+    build:
+      context: ./app_watcher
+      dockerfile: Dockerfile
+    image: streaming-arm/watcher
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-broker:29092}
+      KAFKA_HEARTBEAT_TOPIC: ${KAFKA_HEARTBEAT_TOPIC:-heartbeat}  # same default as kafka-init
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    networks:
+      - shared-network
+
 networks:
   shared-network:
     external: true
